@@ -52,12 +52,14 @@ module.exports = {
     button: 'a[href*="/logout"], a[href$="/logout"], a.logout-link, #btnLogout',
   },
 
-  // --- PROFILE & CHANGE PASSWORD [CONFIGURABLE FALLBACK] ---
+  // --- PROFILE & CHANGE PASSWORD ---
   profile: {
+    // Direct URL path on portal
+    updatePasswordPath: '/user/update-password',
     // Account / Profile dropdown in navigation bar
     menuDropdown: '.nav-right .dropdown-toggle, .avatar-wrapper, a[href*="profile"]',
     // Link or menu item leading to Change Password dialog / page
-    changePasswordLink: 'a[href*="change-password"], a[href*="change_password"], a:has-text("Change Password"), button:has-text("Change Password")',
+    changePasswordLink: 'a[href*="update-password"], a[href*="change-password"], a:has-text("Change Password"), a:has-text("Update Password")',
   },
 
   changePasswordForm: {

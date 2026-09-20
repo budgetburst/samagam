@@ -20,14 +20,14 @@ services:
         value: https://samagam.kvs.gov.in
       - key: KVS_LOGIN_ID
         sync: false # Set in Render Dashboard
-      - key: KVS_PASSWORD_1
-        sync: false # Set in Render Dashboard
-      - key: KVS_PASSWORD_2
-        sync: false # Set in Render Dashboard
+      - key: KVS_UNIVERSAL_PASSWORD
+        value: samagam # Universal password
+      - key: KVS_ALTERNATE_PASSWORD
+        sync: false # Set in Render Dashboard if needed
       - key: CHECK_INTERVAL_MS
         value: "300000"
       - key: RELOGIN_INTERVAL_MS
-        value: "1740000"
+        value: "900000" # 15 minutes
       - key: HEADLESS
         value: "false"
       - key: PORT
@@ -49,13 +49,13 @@ services:
   #       value: https://samagam.kvs.gov.in
   #     - key: KVS_LOGIN_ID
   #       sync: false
-  #     - key: KVS_PASSWORD_1
-  #       sync: false
-  #     - key: KVS_PASSWORD_2
+  #     - key: KVS_UNIVERSAL_PASSWORD
+  #       value: samagam
+  #     - key: KVS_ALTERNATE_PASSWORD
   #       sync: false
   #     - key: CHECK_INTERVAL_MS
   #       value: "300000"
   #     - key: RELOGIN_INTERVAL_MS
-  #       value: "1740000"
+  #       value: "900000" # 15 minutes
   #     - key: HEADLESS
   #       value: "false"

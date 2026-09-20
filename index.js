@@ -4,14 +4,20 @@
  * Optimized for Continuous Background Worker deployment on Render.com
  *
  * Implements:
- * 1. Persistent browser context in containerized environment (Xvfb virtual display).
- * 2. Authenticated main session tracking.
- * 3. 5-minute independent verification cycle in separate browser tabs.
- * 4. Strict password transition state machine (KVS_PASSWORD_1 -> KVS_PASSWORD_2).
- * 5. Mandatory 29-minute logout/login cycling.
- * 6. Mutual exclusion lock (AsyncMutex) preventing race conditions between cycles.
- * 7. Non-sensitive, structured logging with automatic secret redaction.
- * 8. Clean SIGTERM/SIGINT signal handling for zero-downtime Render redeployments.
+ * 1. Universal Password Architecture:
+ *    - The universal baseline password is `samagam` (KVS_UNIVERSAL_PASSWORD).
+ *    - All verifications and relogins target this universal password.
+ * 2. Multi-profile separation:
+ *    - Main Logged-In Profile: Stays authenticated continuously and handles 15m relogin cycle.
+ *    - Verification Profile: Isolated browser profile used for 5m independent credential checks.
+ * 3. Automatic Password Restoration to Universal Password:
+ *    - If the password is changed and 5m verification fails showing incorrect password,
+ *      the engine automatically restores the password BACK to `samagam` from the logged-in profile
+ *      via direct navigation to `https://samagam.kvs.gov.in/user/update-password`.
+ * 4. 15-minute mandatory logout/relogin cycle on the main profile.
+ * 5. AsyncMutex coordinating verification, password restoration, and relogin cycles.
+ * 6. Non-sensitive, structured logging with automatic secret redaction.
+ * 7. Clean SIGTERM/SIGINT signal handling for zero-downtime Render redeployments.
  */
 
 require('dotenv').config();
@@ -28,22 +34,29 @@ const AsyncMutex = require('./mutex');
 const BASE_URL = (process.env.KVS_BASE_URL || 'https://samagam.kvs.gov.in').replace(/\/+$/, '');
 const LOGIN_URL = `${BASE_URL}/user/login`;
 const LOGOUT_URL = `${BASE_URL}/logout`;
+const UPDATE_PASSWORD_URL = `${BASE_URL}/user/update-password`;
 
 const LOGIN_ID = process.env.KVS_LOGIN_ID || 'EP.45354';
-const PASSWORD_1 = process.env.KVS_PASSWORD_1 || 'samagam';
-const PASSWORD_2 = process.env.KVS_PASSWORD_2 || 'writukapanty';
+// Universal password baseline (default: samagam)
+const UNIVERSAL_PASSWORD = process.env.KVS_UNIVERSAL_PASSWORD || process.env.KVS_PASSWORD_1 || 'samagam';
+// Optional alternate password candidate (if password was temporarily changed)
+const ALTERNATE_PASSWORD = process.env.KVS_ALTERNATE_PASSWORD || process.env.KVS_PASSWORD_2 || 'writukapanty';
 
 const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || '300000', 10);   // Default: 5 min
-const RELOGIN_INTERVAL_MS = parseInt(process.env.RELOGIN_INTERVAL_MS || '1740000', 10); // Default: 29 min
+const RELOGIN_INTERVAL_MS = parseInt(process.env.RELOGIN_INTERVAL_MS || '900000', 10); // Updated: 15 min
 
 // In container environments running under Xvfb, HEADLESS=false runs headed inside the virtual display
 const HEADLESS = process.env.HEADLESS === 'true';
 const BROWSER_CHANNEL = process.env.BROWSER_CHANNEL || 'chromium';
 
-// Persistent profile directory for Render (supports attached persistent disk or local container storage)
+// Root data directory for persistent browser context state
 const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
   : path.resolve('./.kvs_render_profile');
+
+// Distinct profiles for the main session and verification checks
+const MAIN_PROFILE_DIR = path.join(DATA_DIR, 'main_profile');
+const VERIFY_PROFILE_DIR = path.join(DATA_DIR, 'verify_profile');
 
 const NAV_TIMEOUT = parseInt(process.env.NAVIGATION_TIMEOUT_MS || '30000', 10);
 const ACTION_TIMEOUT = parseInt(process.env.ACTION_TIMEOUT_MS || '15000', 10);
@@ -53,13 +66,12 @@ const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
 // ==========================================
 // STATE MACHINE & REPORTERS
 // ==========================================
-let activePassword = PASSWORD_1;
-let isPassword2PermanentlyActive = false;
+let activePassword = UNIVERSAL_PASSWORD;
 
-// Global coordination lock between 5m verification and 29m relogin
+// Global coordination lock between 5m verification and 15m relogin
 const sessionMutex = new AsyncMutex();
 
-let browserContext = null;
+let mainBrowserContext = null;
 let mainPage = null;
 let verificationTimer = null;
 let reloginTimer = null;
@@ -72,7 +84,34 @@ let lastReloginResult = { status: 'pending', timestamp: null };
  * Return display-safe indicator of which password is currently active
  */
 function getActivePasswordLabel() {
-  return activePassword === PASSWORD_2 ? 'KVS_PASSWORD_2' : 'KVS_PASSWORD_1';
+  return activePassword === UNIVERSAL_PASSWORD ? 'UNIVERSAL_PASSWORD (samagam)' : 'CUSTOM_PASSWORD';
+}
+
+/**
+ * Identify if an error reason represents an incorrect password or invalid credentials
+ */
+function isIncorrectPasswordError(reason = '') {
+  if (!reason) return false;
+  const r = reason.toLowerCase();
+
+  // Exclude transient infrastructure errors
+  if (r.includes('turnstile') || r.includes('timeout') || r.includes('network') || r.includes('econnrefused')) {
+    return false;
+  }
+
+  // Matches portal error text indicating credential mismatch
+  return (
+    r.includes('password') ||
+    r.includes('invalid') ||
+    r.includes('incorrect') ||
+    r.includes('credential') ||
+    r.includes('not match') ||
+    r.includes('wrong') ||
+    r.includes('mismatch') ||
+    r.includes('auth') ||
+    r.includes('user not found') ||
+    r.includes('account')
+  );
 }
 
 /**
@@ -82,9 +121,18 @@ function getAutomationStatus() {
   return {
     uptimeSeconds: startTime ? Math.floor((Date.now() - startTime) / 1000) : 0,
     activePassword: getActivePasswordLabel(),
-    isPassword2PermanentlyActive,
+    universalPassword: 'samagam',
+    updatePasswordUrl: UPDATE_PASSWORD_URL,
     isMutexLocked: sessionMutex.isLocked(),
-    isBrowserActive: browserContext !== null && mainPage !== null && !mainPage.isClosed(),
+    isBrowserActive: mainBrowserContext !== null && mainPage !== null && !mainPage.isClosed(),
+    profiles: {
+      mainProfile: MAIN_PROFILE_DIR,
+      verifyProfile: VERIFY_PROFILE_DIR,
+    },
+    intervals: {
+      verificationMinutes: CHECK_INTERVAL_MS / 60000,
+      reloginMinutes: RELOGIN_INTERVAL_MS / 60000,
+    },
     lastVerification: lastVerificationResult,
     lastRelogin: lastReloginResult,
   };
@@ -95,15 +143,15 @@ function getAutomationStatus() {
 // ==========================================
 
 /**
- * Launch persistent browser context for Render container / worker environment
+ * Launch persistent browser context for a specific profile directory
  */
-async function launchContext() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+async function launchContext(profileDir, profileLabel = 'Default') {
+  if (!fs.existsSync(profileDir)) {
+    fs.mkdirSync(profileDir, { recursive: true });
   }
 
-  logger.info('Launching persistent browser context for Render worker...', {
-    profileDir: DATA_DIR,
+  logger.info(`Launching persistent browser context (${profileLabel})...`, {
+    profileDir,
     headless: HEADLESS,
     channel: BROWSER_CHANNEL,
     display: process.env.DISPLAY || 'default'
@@ -126,7 +174,7 @@ async function launchContext() {
     launchOptions.channel = BROWSER_CHANNEL;
   }
 
-  const context = await chromium.launchPersistentContext(DATA_DIR, launchOptions);
+  const context = await chromium.launchPersistentContext(profileDir, launchOptions);
   context.setDefaultNavigationTimeout(NAV_TIMEOUT);
   context.setDefaultTimeout(ACTION_TIMEOUT);
 
@@ -178,11 +226,33 @@ async function ensureLoginOverlay(page) {
  * Returns true if token is confirmed, false if timed out.
  */
 async function handleTurnstileIfPresent(page) {
-  const turnstile = page.locator(selectors.login.turnstileContainer);
-  if (await turnstile.isVisible({ timeout: 2000 }).catch(() => false)) {
-    logger.info('Cloudflare Turnstile detected. Awaiting background PoW and verification token...');
+  logger.info('Awaiting Cloudflare Turnstile verification token...');
 
-    // Trigger render if widget hasn't drawn
+  // Trigger render if widget hasn't drawn
+  await page.evaluate(() => {
+    const overlay = document.getElementById('lpLoginOverlay');
+    const cf = overlay ? overlay.querySelector('.cf-turnstile') : document.querySelector('.cf-turnstile');
+    if (cf && !cf.hasChildNodes() && window.turnstile && typeof window.turnstile.render === 'function') {
+      try { window.turnstile.render(cf); } catch (e) {}
+    }
+  }).catch(() => {});
+
+  // Poll for valid cf-turnstile-response token
+  const pollStart = Date.now();
+  let hasValidToken = false;
+
+  while (Date.now() - pollStart < TURNSTILE_TIMEOUT) {
+    const tokenLength = await page.evaluate(() => {
+      const tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
+      return tokenInput && tokenInput.value ? tokenInput.value.length : 0;
+    }).catch(() => 0);
+
+    if (tokenLength > 20) {
+      hasValidToken = true;
+      break;
+    }
+
+    // Periodically nudge render if still empty
     await page.evaluate(() => {
       const overlay = document.getElementById('lpLoginOverlay');
       const cf = overlay ? overlay.querySelector('.cf-turnstile') : document.querySelector('.cf-turnstile');
@@ -191,38 +261,30 @@ async function handleTurnstileIfPresent(page) {
       }
     }).catch(() => {});
 
-    // Poll for valid cf-turnstile-response token
-    const pollStart = Date.now();
-    let hasValidToken = false;
-
-    while (Date.now() - pollStart < TURNSTILE_TIMEOUT) {
-      const tokenLength = await page.evaluate(() => {
-        const tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
-        return tokenInput && tokenInput.value ? tokenInput.value.length : 0;
-      }).catch(() => 0);
-
-      if (tokenLength > 20) {
-        hasValidToken = true;
-        break;
-      }
-      await new Promise(r => setTimeout(r, 500));
-    }
-
-    if (hasValidToken) {
-      logger.info('Turnstile verification token acquired and verified.');
-      return true;
-    } else {
-      if (HEADLESS) {
-        logger.error('Turnstile verification failed in headless mode. On Render, ensure Xvfb is running (npm start via Docker) with HEADLESS=false.');
-      } else {
-        logger.error('Turnstile verification timed out. Token was not generated. Aborting submit to prevent "Security check failed".');
-      }
-      return false;
-    }
+    await new Promise(r => setTimeout(r, 500));
   }
 
-  // If no Turnstile widget on page, proceed normally
-  return true;
+  if (hasValidToken) {
+    logger.info('Turnstile verification token acquired and verified.');
+    return true;
+  } else {
+    // Check if turnstile element exists on page
+    const turnstileExists = await page.evaluate(() => {
+      return !!document.querySelector('.cf-turnstile, input[name="cf-turnstile-response"]');
+    }).catch(() => false);
+
+    if (!turnstileExists) {
+      logger.debug('No Turnstile element detected on page. Proceeding normally.');
+      return true;
+    }
+
+    if (HEADLESS) {
+      logger.error('Turnstile verification failed in headless mode. On Render, ensure Xvfb is running (npm start via Docker) with HEADLESS=false.');
+    } else {
+      logger.error('Turnstile verification timed out. Token was not generated. Aborting submit to prevent "Security check failed".');
+    }
+    return false;
+  }
 }
 
 // ==========================================
@@ -240,6 +302,7 @@ async function performLogin(page, passwordToUse) {
 
     // Human-paced typing to prevent bot telemetry flags
     const userField = page.locator(selectors.login.usernameInput);
+    await userField.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT });
     await userField.click();
     await userField.fill('');
     await userField.pressSequentially(LOGIN_ID, { delay: 40 });
@@ -247,6 +310,7 @@ async function performLogin(page, passwordToUse) {
     await new Promise(r => setTimeout(r, 200));
 
     const passField = page.locator(selectors.login.passwordInput);
+    await passField.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT });
     await passField.click();
     await passField.fill('');
     await passField.pressSequentially(passwordToUse, { delay: 40 });
@@ -262,8 +326,29 @@ async function performLogin(page, passwordToUse) {
       };
     }
 
+    // Double-check and ensure both username and password fields are still populated!
+    // (Prevents edge-case where portal scripts, SweetAlert, or Turnstile reset wipes inputs)
+    const domValues = await page.evaluate(() => ({
+      user: document.querySelector('#lpLoginUsername')?.value,
+      pass: document.querySelector('#lpLoginPassword')?.value,
+    })).catch(() => ({}));
+
+    if (!domValues.user || domValues.user !== LOGIN_ID) {
+      logger.debug('Re-applying username before submission...');
+      await userField.click();
+      await userField.fill('');
+      await userField.pressSequentially(LOGIN_ID, { delay: 30 });
+    }
+
+    if (!domValues.pass || domValues.pass !== passwordToUse) {
+      logger.debug('Re-applying password before submission...');
+      await passField.click();
+      await passField.fill('');
+      await passField.pressSequentially(passwordToUse, { delay: 30 });
+    }
+
     // Brief stabilization pause before form submit
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 600));
 
     logger.debug('Submitting login credentials');
     const submitBtn = page.locator(selectors.login.submitButton);
@@ -315,7 +400,7 @@ async function performLogin(page, passwordToUse) {
  */
 async function isPageAuthenticated(page) {
   try {
-    if (page.isClosed()) return false;
+    if (!page || page.isClosed()) return false;
 
     const currentUrl = page.url();
     if (currentUrl.includes('/dashboard')) return true;
@@ -342,7 +427,7 @@ async function isPageAuthenticated(page) {
  * Perform logout on a page and confirm unauthenticated status
  */
 async function performLogout(page) {
-  logger.info('Initiating logout sequence...');
+  logger.info('Initiating logout sequence on main profile...');
   try {
     const logoutBtn = page.locator(selectors.logout.button).first();
     if (await logoutBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
@@ -359,7 +444,7 @@ async function performLogout(page) {
       page.locator(selectors.session.loginLinkText).waitFor({ state: 'visible', timeout: ACTION_TIMEOUT }),
     ]).catch(() => {});
 
-    logger.info('Logout confirmed. Page is unauthenticated.');
+    logger.info('Logout confirmed. Main profile is unauthenticated.');
     return true;
   } catch (err) {
     logger.warn(`Logout confirmation warning: ${err.message}. Navigating explicitly to login URL.`);
@@ -369,35 +454,24 @@ async function performLogout(page) {
 }
 
 // ==========================================
-// PASSWORD CHANGE WORKFLOW
+// RESTORE PASSWORD TO UNIVERSAL PASSWORD (samagam)
 // ==========================================
 
 /**
- * Execute password change on the main authenticated page:
- * 1. Navigate to Change Password
- * 2. Input current password and new password (PASSWORD_2)
- * 3. Submit and verify confirmation
- * 4. Independently verify in a new tab
- * 5. Update activePassword to PASSWORD_2 permanently
+ * Restores password back to the universal password (samagam) from the logged-in profile.
+ * Navigates directly to https://samagam.kvs.gov.in/user/update-password
+ *
+ * @param {Page} page - The main authenticated page
+ * @param {string} [candidateOldPassword] - Candidate current password if known
+ * @returns {Promise<boolean>}
  */
-async function executePasswordChange(page, currentPassword, newPassword) {
-  logger.warn('Triggering Change Password workflow to KVS_PASSWORD_2 on main authenticated session...');
+async function restorePasswordToUniversal(page, candidateOldPassword) {
+  logger.warn(`Restoring portal password back to universal password (${UNIVERSAL_PASSWORD}) from logged-in profile...`);
+  logger.info(`Navigating directly to: ${UPDATE_PASSWORD_URL}`);
 
   try {
-    // 1. Open Profile / Change Password view
-    const profileDropdown = page.locator(selectors.profile.menuDropdown).first();
-    if (await profileDropdown.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await profileDropdown.click();
-      await new Promise(r => setTimeout(r, 300));
-    }
-
-    const changePassLink = page.locator(selectors.profile.changePasswordLink).first();
-    if (await changePassLink.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await changePassLink.click();
-    } else {
-      // Direct navigation fallback
-      await navigateWithRetry(page, `${BASE_URL}/profile/change-password`);
-    }
+    // 1. Direct navigation to the specified update-password URL
+    await navigateWithRetry(page, UPDATE_PASSWORD_URL);
 
     // 2. Wait for change password form fields
     const currentPassInput = page.locator(selectors.changePasswordForm.currentPasswordInput).first();
@@ -407,29 +481,31 @@ async function executePasswordChange(page, currentPassword, newPassword) {
 
     await currentPassInput.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT });
 
-    // 3. Fill form fields
-    logger.info('Entering current and new credentials into Change Password form...');
+    // Determine old password to provide
+    const oldPasswordToTry = candidateOldPassword || ALTERNATE_PASSWORD || UNIVERSAL_PASSWORD;
+
+    logger.info(`Entering current credential and restoring new password to universal password (${UNIVERSAL_PASSWORD})...`);
     await currentPassInput.fill('');
-    await currentPassInput.fill(currentPassword);
+    await currentPassInput.fill(oldPasswordToTry);
 
     await newPassInput.fill('');
-    await newPassInput.fill(newPassword);
+    await newPassInput.fill(UNIVERSAL_PASSWORD);
 
     await confPassInput.fill('');
-    await confPassInput.fill(newPassword);
+    await confPassInput.fill(UNIVERSAL_PASSWORD);
 
-    // 4. Submit change request
-    logger.info('Submitting password change request...');
+    // 3. Submit change request
+    logger.info('Submitting password update request to portal...');
     await submitBtn.click();
 
-    // 5. Verify website reports successful password modification
+    // 4. Verify website reports successful password modification
     const isSuccess = await Promise.race([
       page.locator(selectors.changePasswordForm.successMessage).first().waitFor({ state: 'visible', timeout: ACTION_TIMEOUT })
         .then(() => true),
       page.locator(selectors.changePasswordForm.errorMessage).first().waitFor({ state: 'visible', timeout: ACTION_TIMEOUT })
         .then(async (loc) => {
           const msg = await loc.innerText().catch(() => '');
-          throw new Error(`Portal reported password change failure: ${msg}`);
+          throw new Error(`Portal reported password update failure: ${msg}`);
         }),
     ]).catch((e) => {
       logger.warn(`Password change confirmation notice check: ${e.message}`);
@@ -437,29 +513,26 @@ async function executePasswordChange(page, currentPassword, newPassword) {
     });
 
     if (!isSuccess) {
-      logger.error('Failed to confirm password modification on the portal.');
+      logger.error('Failed to confirm password restoration on the portal.');
       return false;
     }
 
-    logger.info('Portal reported successful password modification.');
+    logger.info(`Portal reported successful password modification!`);
 
-    // 6. Set candidate active password
-    activePassword = newPassword;
-
-    // 7. Perform independent verification in a new verification tab using PASSWORD_2
-    logger.info('Conducting mandatory independent verification for KVS_PASSWORD_2...');
-    const verification = await verifyInNewTab(newPassword);
+    // 5. Conduct mandatory independent verification in separate verification profile using UNIVERSAL_PASSWORD
+    logger.info(`Conducting mandatory independent verification for universal password (${UNIVERSAL_PASSWORD}) using separate verification profile...`);
+    const verification = await verifyInSeparateProfile(UNIVERSAL_PASSWORD);
 
     if (verification.success) {
-      isPassword2PermanentlyActive = true;
-      logger.info('Independent verification succeeded! State transition finalized: ACTIVE_PASSWORD = KVS_PASSWORD_2.');
+      activePassword = UNIVERSAL_PASSWORD;
+      logger.info(`Independent verification succeeded! Password is now confirmed as universal password (${UNIVERSAL_PASSWORD}).`);
       return true;
     } else {
-      logger.error(`Independent verification for KVS_PASSWORD_2 failed: ${verification.reason}`);
+      logger.error(`Independent verification for universal password failed: ${verification.reason}`);
       return false;
     }
   } catch (err) {
-    logger.error(`Error during password change workflow: ${err.message}`);
+    logger.error(`Error during password restoration workflow: ${err.message}`);
     return false;
   }
 }
@@ -469,42 +542,47 @@ async function executePasswordChange(page, currentPassword, newPassword) {
 // ==========================================
 
 /**
- * Open a completely new browser tab, attempt authentication, and close the tab.
- * Does not expose passwords, cookies, or tokens in logs.
+ * Perform verification attempt using a completely separate browser profile.
+ * Does not share cookies, storage, or session state with the main logged-in profile.
  * @returns {Promise<{ success: boolean, reason?: string }>}
  */
-async function verifyInNewTab(passwordToTest) {
-  let verificationTab = null;
+async function verifyInSeparateProfile(passwordToTest) {
+  let verifyContext = null;
   try {
-    logger.info('Opening new browser tab for independent credential verification...');
-    verificationTab = await browserContext.newPage();
+    logger.info(`Opening isolated verification browser profile (${VERIFY_PROFILE_DIR})...`);
+    verifyContext = await launchContext(VERIFY_PROFILE_DIR, 'Verification Profile');
 
-    const result = await performLogin(verificationTab, passwordToTest);
+    const pages = verifyContext.pages();
+    const verifyPage = pages.length > 0 ? pages[0] : await verifyContext.newPage();
+
+    const result = await performLogin(verifyPage, passwordToTest);
     return result;
   } catch (err) {
-    return { success: false, reason: `Verification tab error: ${err.message}` };
+    return { success: false, reason: `Verification profile error: ${err.message}` };
   } finally {
-    if (verificationTab && !verificationTab.isClosed()) {
-      await verificationTab.close().catch(() => {});
-      logger.debug('Verification browser tab closed.');
+    if (verifyContext) {
+      await verifyContext.close().catch(() => {});
+      logger.debug('Verification browser profile closed cleanly.');
     }
   }
 }
 
 /**
  * 5-Minute verification cycle handler
+ * Checks if portal still authenticates with universal password (samagam).
+ * If password was changed and verification fails, restores password back to samagam from logged-in profile.
  */
 async function runVerificationCycle() {
   if (isShuttingDown) return;
 
-  logger.info(`[5-Min Cycle] Running independent password/session verification (${getActivePasswordLabel()})...`);
+  logger.info(`[5-Min Cycle] Running independent verification in separate profile for universal password (${UNIVERSAL_PASSWORD})...`);
   const unlock = await sessionMutex.acquire();
 
   try {
-    // 1. Check if main page is still alive
+    // 1. Ensure main logged-in page reference is valid
     if (!mainPage || mainPage.isClosed()) {
-      logger.warn('Main session page closed or crashed. Re-establishing main session...');
-      mainPage = await browserContext.newPage();
+      logger.warn('Main logged-in session page closed or crashed. Re-establishing main session...');
+      mainPage = await mainBrowserContext.newPage();
       const loginRes = await performLogin(mainPage, activePassword);
       if (!loginRes.success) {
         logger.error(`Failed to re-establish main session: ${loginRes.reason}`);
@@ -512,8 +590,8 @@ async function runVerificationCycle() {
       return;
     }
 
-    // 2. Attempt verification with currently active password in isolated tab
-    const verificationResult = await verifyInNewTab(activePassword);
+    // 2. Attempt verification with universal password in separate verification profile
+    const verificationResult = await verifyInSeparateProfile(UNIVERSAL_PASSWORD);
     lastVerificationResult = {
       status: verificationResult.success ? 'success' : 'failed',
       reason: verificationResult.reason || null,
@@ -521,21 +599,32 @@ async function runVerificationCycle() {
     };
 
     if (verificationResult.success) {
-      logger.info(`[5-Min Cycle] Verification successful. ${getActivePasswordLabel()} is valid.`);
+      logger.info(`[5-Min Cycle] Verification successful. Universal password (${UNIVERSAL_PASSWORD}) is valid on the portal.`);
+      activePassword = UNIVERSAL_PASSWORD;
       return;
     }
 
-    logger.warn(`[5-Min Cycle] Verification failed for ${getActivePasswordLabel()}: ${verificationResult.reason}`);
+    const isPasswordError = isIncorrectPasswordError(verificationResult.reason);
+    logger.warn(`[5-Min Cycle] Verification failed for universal password (${UNIVERSAL_PASSWORD}): ${verificationResult.reason} (isIncorrectPassword: ${isPasswordError})`);
 
-    // 3. Current password failed. Check if main session page is still authenticated
-    const mainStillAuthenticated = await isPageAuthenticated(mainPage);
-    logger.info(`Checking main session status: ${mainStillAuthenticated ? 'STILL AUTHENTICATED' : 'UNAUTHENTICATED'}`);
+    // 3. If password was changed and verification fails, change it back to samagam from logged-in profile
+    if (isPasswordError) {
+      const mainStillAuthenticated = await isPageAuthenticated(mainPage);
+      logger.info(`Checking logged-in profile status: ${mainStillAuthenticated ? 'STILL AUTHENTICATED' : 'UNAUTHENTICATED'}`);
 
-    if (mainStillAuthenticated && !isPassword2PermanentlyActive) {
-      logger.warn('Current password failed while main page is still authenticated. Initiating immediate password change to KVS_PASSWORD_2...');
-      await executePasswordChange(mainPage, activePassword, PASSWORD_2);
-    } else if (!mainStillAuthenticated) {
-      logger.error('Main session has expired or unauthenticated. Relogin required.');
+      if (mainStillAuthenticated) {
+        logger.warn(`Password was changed away from universal password! Initiating password restore to ${UNIVERSAL_PASSWORD} from logged-in profile...`);
+        const restored = await restorePasswordToUniversal(mainPage, ALTERNATE_PASSWORD);
+        if (restored) {
+          logger.info(`Password successfully restored back to universal password (${UNIVERSAL_PASSWORD})!`);
+        } else {
+          logger.error(`Failed to restore password back to universal password.`);
+        }
+      } else {
+        logger.error('Main session has expired or unauthenticated. Cannot restore password from logged-in profile without an active session.');
+      }
+    } else {
+      logger.warn(`[5-Min Cycle] Failure reason was not an incorrect password error (likely transient/network). Skipping password restore.`);
     }
   } catch (err) {
     logger.error(`[5-Min Cycle] Unexpected error in verification cycle: ${err.message}`);
@@ -546,26 +635,26 @@ async function runVerificationCycle() {
 }
 
 /**
- * 29-Minute logout/login cycle handler
+ * 15-Minute logout/login cycle handler (runs on main profile using universal password)
  */
 async function runReloginCycle() {
   if (isShuttingDown) return;
 
-  logger.info('[29-Min Cycle] Starting mandatory 29-minute logout/login cycle...');
+  logger.info('[15-Min Cycle] Starting mandatory 15-minute logout/login cycle on main profile...');
   const unlock = await sessionMutex.acquire();
 
   try {
-    // 1. Ensure main page reference is valid
+    // 1. Ensure main page reference is valid in main profile
     if (!mainPage || mainPage.isClosed()) {
-      mainPage = await browserContext.newPage();
+      mainPage = await mainBrowserContext.newPage();
     }
 
-    // 2. Perform actual Logout on main page
+    // 2. Perform actual Logout on main logged-in page
     await performLogout(mainPage);
 
-    // 3. Attempt login with currently active password (strictly activePassword only)
-    logger.info(`[29-Min Cycle] Attempting relogin using ${getActivePasswordLabel()}...`);
-    const loginResult = await performLogin(mainPage, activePassword);
+    // 3. Attempt login with universal password
+    logger.info(`[15-Min Cycle] Attempting relogin using universal password (${UNIVERSAL_PASSWORD})...`);
+    const loginResult = await performLogin(mainPage, UNIVERSAL_PASSWORD);
 
     lastReloginResult = {
       status: loginResult.success ? 'success' : 'failed',
@@ -574,12 +663,13 @@ async function runReloginCycle() {
     };
 
     if (loginResult.success) {
-      logger.info(`[29-Min Cycle] Relogin successful using ${getActivePasswordLabel()}. Session reference refreshed.`);
+      activePassword = UNIVERSAL_PASSWORD;
+      logger.info(`[15-Min Cycle] Relogin successful using universal password (${UNIVERSAL_PASSWORD}). Main profile session reference refreshed.`);
     } else {
-      logger.error(`[29-Min Cycle] Relogin could not be completed with ${getActivePasswordLabel()}: ${loginResult.reason}`);
+      logger.error(`[15-Min Cycle] Relogin could not be completed with universal password: ${loginResult.reason}`);
     }
   } catch (err) {
-    logger.error(`[29-Min Cycle] Unexpected error during relogin cycle: ${err.message}`);
+    logger.error(`[15-Min Cycle] Unexpected error during relogin cycle: ${err.message}`);
     lastReloginResult = { status: 'error', reason: err.message, timestamp: new Date().toISOString() };
   } finally {
     unlock();
@@ -596,44 +686,65 @@ async function startAutomation() {
   logger.info('Starting KVS Samagam Continuous Automation Engine (Render)');
   logger.info(`Target URL: ${BASE_URL}`);
   logger.info(`Login ID: ${LOGIN_ID}`);
-  logger.info(`Initial Active Password: ${getActivePasswordLabel()}`);
-  logger.info(`Verification Interval: ${CHECK_INTERVAL_MS / 1000}s | Relogin Interval: ${RELOGIN_INTERVAL_MS / 1000}s`);
+  logger.info(`Universal Password: ${UNIVERSAL_PASSWORD}`);
+  logger.info(`Password Update URL: ${UPDATE_PASSWORD_URL}`);
+  logger.info(`Main Profile: ${MAIN_PROFILE_DIR}`);
+  logger.info(`Verification Profile: ${VERIFY_PROFILE_DIR}`);
+  logger.info(`Verification Interval: ${CHECK_INTERVAL_MS / 1000}s | Relogin Interval: ${RELOGIN_INTERVAL_MS / 1000}s (15m)`);
   logger.info('========================================================');
 
-  // Launch browser context
-  browserContext = await launchContext();
+  // Launch main browser context for continuous logged-in session
+  mainBrowserContext = await launchContext(MAIN_PROFILE_DIR, 'Main Logged-In Profile');
 
   // Create initial main page
-  const pages = browserContext.pages();
-  mainPage = pages.length > 0 ? pages[0] : await browserContext.newPage();
+  const pages = mainBrowserContext.pages();
+  mainPage = pages.length > 0 ? pages[0] : await mainBrowserContext.newPage();
 
   // Acquire lock for initial login
   const unlock = await sessionMutex.acquire();
   try {
-    logger.info(`Attempting initial login on main page with ${getActivePasswordLabel()}...`);
-    const initialLogin = await performLogin(mainPage, activePassword);
+    logger.info(`Attempting initial login on main page with universal password (${UNIVERSAL_PASSWORD})...`);
+    let initialLogin = await performLogin(mainPage, UNIVERSAL_PASSWORD);
+
+    // If initial login encountered a transient error (e.g. Turnstile timing or network), retry once cleanly with universal password
+    if (!initialLogin.success && !isIncorrectPasswordError(initialLogin.reason)) {
+      logger.warn(`Initial attempt encountered transient issue: ${initialLogin.reason}. Retrying cleanly in 3s with universal password...`);
+      await new Promise(r => setTimeout(r, 3000));
+      initialLogin = await performLogin(mainPage, UNIVERSAL_PASSWORD);
+    }
+
+    // If initial login genuinely returned credential failure, check alternate password candidate to restore back to universal password
+    if (!initialLogin.success && isIncorrectPasswordError(initialLogin.reason) && ALTERNATE_PASSWORD) {
+      logger.warn(`Universal password failed with credential mismatch: ${initialLogin.reason}. Checking alternate candidate...`);
+      const altLogin = await performLogin(mainPage, ALTERNATE_PASSWORD);
+      if (altLogin.success) {
+        logger.info(`Logged in with alternate password. Automatically restoring password to universal password (${UNIVERSAL_PASSWORD})...`);
+        await restorePasswordToUniversal(mainPage, ALTERNATE_PASSWORD);
+        initialLogin = altLogin;
+      }
+    }
 
     if (!initialLogin.success) {
-      logger.warn(`Initial login with ${getActivePasswordLabel()} failed: ${initialLogin.reason}`);
+      logger.warn(`Initial login failed: ${initialLogin.reason}`);
       logger.error('CRITICAL: Initial login could not be completed. Automation will maintain session loop and retry on scheduled intervals.');
     } else {
-      logger.info('Initial authentication successful. Main session established and referenced.');
+      logger.info('Initial authentication successful. Main logged-in session established and referenced.');
     }
   } finally {
     unlock();
   }
 
-  // Setup periodic 5-minute verification interval
+  // Setup periodic 5-minute verification interval (runs in separate verification profile)
   verificationTimer = setInterval(() => {
     runVerificationCycle().catch(err => logger.error(`Verification interval error: ${err.message}`));
   }, CHECK_INTERVAL_MS);
 
-  // Setup periodic 29-minute logout/login interval
+  // Setup periodic 15-minute logout/login interval (runs on main logged-in profile)
   reloginTimer = setInterval(() => {
     runReloginCycle().catch(err => logger.error(`Relogin interval error: ${err.message}`));
   }, RELOGIN_INTERVAL_MS);
 
-  logger.info('All timers initialized. Automation is active and monitoring continuously.');
+  logger.info('All timers initialized (Verification: 5m | Relogin: 15m). Automation is active and monitoring continuously.');
 }
 
 /**
@@ -648,12 +759,12 @@ async function shutdown(signal) {
   if (reloginTimer) clearInterval(reloginTimer);
 
   try {
-    if (browserContext) {
-      logger.info('Closing browser context and preserving profile state...');
-      await browserContext.close();
+    if (mainBrowserContext) {
+      logger.info('Closing main browser context and preserving profile state...');
+      await mainBrowserContext.close();
     }
   } catch (err) {
-    logger.error(`Error while closing browser context: ${err.message}`);
+    logger.error(`Error while closing main browser context: ${err.message}`);
   }
 
   logger.info('Shutdown complete.');
@@ -678,5 +789,13 @@ module.exports = {
   getAutomationStatus,
   runVerificationCycle,
   runReloginCycle,
+  verifyInSeparateProfile,
+  restorePasswordToUniversal,
+  isIncorrectPasswordError,
   sessionMutex,
+  UNIVERSAL_PASSWORD,
+  ALTERNATE_PASSWORD,
+  UPDATE_PASSWORD_URL,
+  MAIN_PROFILE_DIR,
+  VERIFY_PROFILE_DIR,
 };

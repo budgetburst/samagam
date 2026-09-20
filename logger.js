@@ -6,11 +6,17 @@
 
 function getSensitiveValues() {
   const sensitive = [];
-  if (process.env.KVS_PASSWORD_1 && process.env.KVS_PASSWORD_1.length > 2) {
-    sensitive.push(process.env.KVS_PASSWORD_1);
-  }
-  if (process.env.KVS_PASSWORD_2 && process.env.KVS_PASSWORD_2.length > 2) {
-    sensitive.push(process.env.KVS_PASSWORD_2);
+  const vars = [
+    process.env.KVS_UNIVERSAL_PASSWORD,
+    process.env.KVS_PASSWORD_1,
+    process.env.KVS_PASSWORD_2,
+    process.env.KVS_ALTERNATE_PASSWORD,
+    'samagam', // explicitly safeguard universal password value
+  ];
+  for (const v of vars) {
+    if (v && typeof v === 'string' && v.length > 2 && !sensitive.includes(v)) {
+      sensitive.push(v);
+    }
   }
   return sensitive;
 }
