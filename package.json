@@ -1,0 +1,29 @@
+{
+  "name": "kvs-samagam-render-automation",
+  "version": "1.0.0",
+  "description": "Continuous KVS Samagam Portal automation background worker designed for Render.com",
+  "main": "server.js",
+  "scripts": {
+    "start": "xvfb-run --server-args=\"-screen 0 1366x768x24 -ac\" node server.js",
+    "start:local": "node server.js",
+    "worker": "xvfb-run --server-args=\"-screen 0 1366x768x24 -ac\" node index.js",
+    "worker:local": "node index.js",
+    "test": "node test-verification.js"
+  },
+  "keywords": [
+    "playwright",
+    "render",
+    "automation",
+    "kvs-samagam",
+    "background-worker"
+  ],
+  "author": "OJAS",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "playwright": "^1.50.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,61 @@
+# ==========================================
+# Render.com Blueprint (render.yaml)
+# https://render.com/docs/blueprint-spec
+# ==========================================
+
+services:
+  # -------------------------------------------------------------
+  # OPTION 1: Web Service (Compatible with Render Free Tier)
+  # Includes HTTP /healthz listener on port 10000 while running
+  # the continuous Playwright automation in the background.
+  # -------------------------------------------------------------
+  - type: web
+    name: kvs-samagam-automation-service
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    envVars:
+      - key: KVS_BASE_URL
+        value: https://samagam.kvs.gov.in
+      - key: KVS_LOGIN_ID
+        sync: false # Set in Render Dashboard
+      - key: KVS_PASSWORD_1
+        sync: false # Set in Render Dashboard
+      - key: KVS_PASSWORD_2
+        sync: false # Set in Render Dashboard
+      - key: CHECK_INTERVAL_MS
+        value: "300000"
+      - key: RELOGIN_INTERVAL_MS
+        value: "1740000"
+      - key: HEADLESS
+        value: "false"
+      - key: PORT
+        value: "10000"
+
+  # -------------------------------------------------------------
+  # OPTION 2: Dedicated Background Worker (Render Paid Starter Plan)
+  # Continuous background process with automatic restarts on crash.
+  # Uncomment this service block if using a paid Background Worker plan.
+  # -------------------------------------------------------------
+  # - type: worker
+  #   name: kvs-samagam-background-worker
+  #   runtime: docker
+  #   dockerfilePath: ./Dockerfile
+  #   plan: starter
+  #   region: oregon
+  #   envVars:
+  #     - key: KVS_BASE_URL
+  #       value: https://samagam.kvs.gov.in
+  #     - key: KVS_LOGIN_ID
+  #       sync: false
+  #     - key: KVS_PASSWORD_1
+  #       sync: false
+  #     - key: KVS_PASSWORD_2
+  #       sync: false
+  #     - key: CHECK_INTERVAL_MS
+  #       value: "300000"
+  #     - key: RELOGIN_INTERVAL_MS
+  #       value: "1740000"
+  #     - key: HEADLESS
+  #       value: "false"
