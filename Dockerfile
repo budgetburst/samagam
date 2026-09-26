@@ -30,8 +30,8 @@ RUN mkdir -p /app/.kvs_render_profile && chown -R pwuser:pwuser /app
 # Switch to non-root pwuser provided by the official Playwright image
 USER pwuser
 
-# Expose Render HTTP port
-EXPOSE 10000
+# Expose HTTP port (10000 for Render, 7860 for Hugging Face Spaces)
+EXPOSE 10000 7860
 
 # Run via xvfb-run to provide virtual display :99 for Cloudflare Turnstile evaluation
 CMD ["xvfb-run", "--server-args=-screen 0 1366x768x24 -ac", "node", "server.js"]
