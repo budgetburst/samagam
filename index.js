@@ -75,10 +75,71 @@ let mainBrowserContext = null;
 let mainPage = null;
 let verificationTimer = null;
 let reloginTimer = null;
+let countdownTimer = null;
 let isShuttingDown = false;
 let startTime = null;
 let lastVerificationResult = { status: 'pending', timestamp: null };
 let lastReloginResult = { status: 'pending', timestamp: null };
+
+let nextVerificationTime = null;
+let nextReloginTime = null;
+let isVerificationRunning = false;
+let isReloginRunning = false;
+let lastLoggedMilestoneMinute = null;
+
+/**
+ * Format milliseconds remaining into MMm SSs string
+ */
+function formatRemaining(ms) {
+  if (ms <= 0) return '00m 00s (due)';
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}m ${String(seconds).padStart(2, '0')}s`;
+}
+
+/**
+ * Format status string for countdown
+ */
+function getCountdownStatusString() {
+  const now = Date.now();
+  const vMs = nextVerificationTime ? nextVerificationTime - now : 0;
+  const rMs = nextReloginTime ? nextReloginTime - now : 0;
+
+  const vStr = isVerificationRunning ? 'in progress...' : formatRemaining(vMs);
+  const rStr = isReloginRunning ? 'in progress...' : formatRemaining(rMs);
+
+  return `Next Verification in: ${vStr} | Next Relogin in: ${rStr}`;
+}
+
+/**
+ * Render live countdown ticker in CMD / terminal
+ */
+function renderCountdownTick() {
+  if (isShuttingDown) return;
+  const now = Date.now();
+  const vMs = nextVerificationTime ? nextVerificationTime - now : 0;
+  const rMs = nextReloginTime ? nextReloginTime - now : 0;
+
+  const vStr = isVerificationRunning ? 'in progress...' : formatRemaining(vMs);
+  const rStr = isReloginRunning ? 'in progress...' : formatRemaining(rMs);
+  const activeLabel = activePassword === UNIVERSAL_PASSWORD ? 'samagam' : 'custom';
+
+  const tickerMsg = `⏱️  [TIMERS] Verification in: ${vStr} | Relogin in: ${rStr} (Active: ${activeLabel})`;
+
+  if (process.stdout && process.stdout.isTTY) {
+    process.stdout.write(`\r\x1b[K${tickerMsg}`);
+  }
+
+  // Periodic milestone log every 60 seconds (or in non-TTY environments like Render logs)
+  const currentMinuteFloor = Math.floor(now / 60000);
+  if (lastLoggedMilestoneMinute !== currentMinuteFloor) {
+    lastLoggedMilestoneMinute = currentMinuteFloor;
+    if (!process.stdout || !process.stdout.isTTY) {
+      logger.info(`[TIMERS] Countdown: Verification in ${vStr} | Relogin in ${rStr}`);
+    }
+  }
+}
 
 /**
  * Return display-safe indicator of which password is currently active
@@ -118,6 +179,10 @@ function isIncorrectPasswordError(reason = '') {
  * Get engine status for health checks & monitoring
  */
 function getAutomationStatus() {
+  const now = Date.now();
+  const vMs = nextVerificationTime ? Math.max(0, nextVerificationTime - now) : 0;
+  const rMs = nextReloginTime ? Math.max(0, nextReloginTime - now) : 0;
+
   return {
     uptimeSeconds: startTime ? Math.floor((Date.now() - startTime) / 1000) : 0,
     activePassword: getActivePasswordLabel(),
@@ -132,6 +197,12 @@ function getAutomationStatus() {
     intervals: {
       verificationMinutes: CHECK_INTERVAL_MS / 60000,
       reloginMinutes: RELOGIN_INTERVAL_MS / 60000,
+    },
+    timeRemaining: {
+      verificationSeconds: Math.floor(vMs / 1000),
+      verificationFormatted: isVerificationRunning ? 'in progress...' : formatRemaining(vMs),
+      reloginSeconds: Math.floor(rMs / 1000),
+      reloginFormatted: isReloginRunning ? 'in progress...' : formatRemaining(rMs),
     },
     lastVerification: lastVerificationResult,
     lastRelogin: lastReloginResult,
@@ -630,6 +701,9 @@ async function runVerificationCycle() {
     logger.error(`[5-Min Cycle] Unexpected error in verification cycle: ${err.message}`);
     lastVerificationResult = { status: 'error', reason: err.message, timestamp: new Date().toISOString() };
   } finally {
+    isVerificationRunning = false;
+    nextVerificationTime = Date.now() + CHECK_INTERVAL_MS;
+    logger.info(`[TIMERS] Verification cycle concluded. Next check in ${formatRemaining(CHECK_INTERVAL_MS)} | Next relogin in ${formatRemaining(nextReloginTime ? nextReloginTime - Date.now() : 0)}`);
     unlock();
   }
 }
@@ -640,6 +714,7 @@ async function runVerificationCycle() {
 async function runReloginCycle() {
   if (isShuttingDown) return;
 
+  isReloginRunning = true;
   logger.info('[15-Min Cycle] Starting mandatory 15-minute logout/login cycle on main profile...');
   const unlock = await sessionMutex.acquire();
 
@@ -672,6 +747,9 @@ async function runReloginCycle() {
     logger.error(`[15-Min Cycle] Unexpected error during relogin cycle: ${err.message}`);
     lastReloginResult = { status: 'error', reason: err.message, timestamp: new Date().toISOString() };
   } finally {
+    isReloginRunning = false;
+    nextReloginTime = Date.now() + RELOGIN_INTERVAL_MS;
+    logger.info(`[TIMERS] Relogin cycle concluded. Next relogin in ${formatRemaining(RELOGIN_INTERVAL_MS)} | Next verification in ${formatRemaining(nextVerificationTime ? nextVerificationTime - Date.now() : 0)}`);
     unlock();
   }
 }
@@ -734,6 +812,10 @@ async function startAutomation() {
     unlock();
   }
 
+  // Set initial countdown target timestamps
+  nextVerificationTime = Date.now() + CHECK_INTERVAL_MS;
+  nextReloginTime = Date.now() + RELOGIN_INTERVAL_MS;
+
   // Setup periodic 5-minute verification interval (runs in separate verification profile)
   verificationTimer = setInterval(() => {
     runVerificationCycle().catch(err => logger.error(`Verification interval error: ${err.message}`));
@@ -744,7 +826,13 @@ async function startAutomation() {
     runReloginCycle().catch(err => logger.error(`Relogin interval error: ${err.message}`));
   }, RELOGIN_INTERVAL_MS);
 
+  // Setup 1-second countdown ticker in CMD / terminal
+  countdownTimer = setInterval(() => {
+    renderCountdownTick();
+  }, 1000);
+
   logger.info('All timers initialized (Verification: 5m | Relogin: 15m). Automation is active and monitoring continuously.');
+  logger.info(`[TIMERS] Live countdown started: Next Verification in ${formatRemaining(CHECK_INTERVAL_MS)} | Next Relogin in ${formatRemaining(RELOGIN_INTERVAL_MS)}`);
 }
 
 /**
@@ -753,8 +841,14 @@ async function startAutomation() {
 async function shutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
+  if (process.stdout && process.stdout.isTTY) {
+    try {
+      process.stdout.write('\r\x1b[K');
+    } catch (e) {}
+  }
   logger.info(`Received ${signal}. Performing graceful shutdown on Render worker...`);
 
+  if (countdownTimer) clearInterval(countdownTimer);
   if (verificationTimer) clearInterval(verificationTimer);
   if (reloginTimer) clearInterval(reloginTimer);
 
@@ -792,6 +886,9 @@ module.exports = {
   verifyInSeparateProfile,
   restorePasswordToUniversal,
   isIncorrectPasswordError,
+  formatRemaining,
+  getCountdownStatusString,
+  renderCountdownTick,
   sessionMutex,
   UNIVERSAL_PASSWORD,
   ALTERNATE_PASSWORD,

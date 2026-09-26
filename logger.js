@@ -71,19 +71,35 @@ function formatLog(level, message, meta) {
   return output;
 }
 
+function writeLog(level, message, meta) {
+  const line = formatLog(level, message, meta);
+  if (process.stdout && process.stdout.isTTY) {
+    try {
+      process.stdout.write('\r\x1b[K');
+    } catch (e) {}
+  }
+  if (level === 'ERROR') {
+    console.error(line);
+  } else if (level === 'WARN') {
+    console.warn(line);
+  } else {
+    console.log(line);
+  }
+}
+
 const logger = {
   info: (message, meta) => {
-    console.log(formatLog('INFO', message, meta));
+    writeLog('INFO', message, meta);
   },
   warn: (message, meta) => {
-    console.warn(formatLog('WARN', message, meta));
+    writeLog('WARN', message, meta);
   },
   error: (message, meta) => {
-    console.error(formatLog('ERROR', message, meta));
+    writeLog('ERROR', message, meta);
   },
   debug: (message, meta) => {
     if (process.env.DEBUG === 'true') {
-      console.log(formatLog('DEBUG', message, meta));
+      writeLog('DEBUG', message, meta);
     }
   },
   sanitize
