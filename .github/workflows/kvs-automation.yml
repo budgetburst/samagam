@@ -1,12 +1,9 @@
 name: KVS Samagam Portal Automation
 
 on:
-  # Scheduled execution:
-  # Every 30 minutes 24/7 = 1,440 runs/month (fits comfortably inside GitHub's 2,000 free runner minutes!)
-  # TIP: If you prefer every 15 minutes during school hours (7:30 AM to 7:30 PM IST, Mon-Sat), use:
-  # - cron: '*/15 2-14 * * 1-6'
+  # Automated schedule: runs every 28 minutes
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/28 * * * *'
 
   # Manual on-demand execution from GitHub "Actions" tab
   workflow_dispatch:
@@ -14,15 +11,15 @@ on:
       mode:
         description: 'Execution Mode'
         required: true
-        default: 'single-pass'
+        default: 'continuous-loop'
         type: choice
         options:
-          - 'single-pass'
           - 'continuous-loop'
+          - 'single-pass'
       duration_minutes:
-        description: 'Duration (in minutes) if running continuous loop (max 350)'
+        description: 'Duration (in minutes) for continuous loop (max 350)'
         required: false
-        default: '60'
+        default: '350'
 
 concurrency:
   group: kvs-samagam-workflow
@@ -64,11 +61,25 @@ jobs:
           KVS_UNIVERSAL_PASSWORD: ${{ secrets.KVS_UNIVERSAL_PASSWORD || 'samagam' }}
           KVS_ALTERNATE_PASSWORD: ${{ secrets.KVS_ALTERNATE_PASSWORD }}
           HEADLESS: 'false'
-          MODE: ${{ github.event.inputs.mode || 'single-pass' }}
-          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.duration_minutes || '0' }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_DURATION: ${{ github.event.inputs.duration_minutes }}
+          SECRET_SCHEDULE_MODE: ${{ secrets.SCHEDULE_MODE }}
+          SECRET_SCHEDULE_DURATION: ${{ secrets.SCHEDULE_DURATION_MINUTES }}
         run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            MODE="${INPUT_MODE:-continuous-loop}"
+            MAX_RUNTIME_MINUTES="${INPUT_DURATION:-350}"
+          else
+            # Automated 28-minute schedule: runs continuous loop for 26 minutes (max possible within interval)
+            MODE="${SECRET_SCHEDULE_MODE:-continuous-loop}"
+            MAX_RUNTIME_MINUTES="${SECRET_SCHEDULE_DURATION:-26}"
+          fi
+
+          export MODE MAX_RUNTIME_MINUTES
+
           if [ "$MODE" = "continuous-loop" ]; then
-            echo "🚀 Launching continuous automation worker for ${MAX_RUNTIME_MINUTES} minutes..."
+            echo "🚀 Launching continuous automation worker (max runtime: ${MAX_RUNTIME_MINUTES}m)..."
             xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24 -ac" node index.js
           else
             echo "⚡ Launching single-pass verification & session relogin..."
