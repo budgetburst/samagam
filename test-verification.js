@@ -129,6 +129,12 @@ Promise.all([taskA(), taskB()]).then(() => {
   assert.strictEqual(currentPasswordOnPortal, 'samagam');
   console.log('   [PASS] Password restored back to universal password (samagam) from logged-in profile.');
 
+  // 8. Verify Action Runner Module
+  console.log('8. Testing Action Runner Module Structure...');
+  const { runSinglePass } = require('./action-runner');
+  assert(typeof runSinglePass === 'function', 'runSinglePass is not a function');
+  console.log('   [PASS] Action runner module loaded and verified successfully.');
+
   console.log('--- ALL VERIFICATION CHECKS PASSED SUCCESSFULLY ---');
 }).catch(err => {
   console.error('VERIFICATION FAILED:', err);

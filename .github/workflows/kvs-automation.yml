@@ -1,0 +1,76 @@
+name: KVS Samagam Portal Automation
+
+on:
+  # Scheduled execution:
+  # Every 30 minutes 24/7 = 1,440 runs/month (fits comfortably inside GitHub's 2,000 free runner minutes!)
+  # TIP: If you prefer every 15 minutes during school hours (7:30 AM to 7:30 PM IST, Mon-Sat), use:
+  # - cron: '*/15 2-14 * * 1-6'
+  schedule:
+    - cron: '*/30 * * * *'
+
+  # Manual on-demand execution from GitHub "Actions" tab
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Execution Mode'
+        required: true
+        default: 'single-pass'
+        type: choice
+        options:
+          - 'single-pass'
+          - 'continuous-loop'
+      duration_minutes:
+        description: 'Duration (in minutes) if running continuous loop (max 350)'
+        required: false
+        default: '60'
+
+concurrency:
+  group: kvs-samagam-workflow
+  cancel-in-progress: false
+
+jobs:
+  run-automation:
+    name: Run KVS Automation Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Restore browser session cache
+        uses: actions/cache@v4
+        with:
+          path: .kvs_render_profile
+          key: kvs-profile-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            kvs-profile-${{ runner.os }}-
+
+      - name: Install Node dependencies
+        run: npm ci || npm install
+
+      - name: Install Playwright & OS dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Run KVS Automation
+        env:
+          KVS_LOGIN_ID: ${{ secrets.KVS_LOGIN_ID }}
+          KVS_UNIVERSAL_PASSWORD: ${{ secrets.KVS_UNIVERSAL_PASSWORD || 'samagam' }}
+          KVS_ALTERNATE_PASSWORD: ${{ secrets.KVS_ALTERNATE_PASSWORD }}
+          HEADLESS: 'false'
+          MODE: ${{ github.event.inputs.mode || 'single-pass' }}
+          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.duration_minutes || '0' }}
+        run: |
+          if [ "$MODE" = "continuous-loop" ]; then
+            echo "🚀 Launching continuous automation worker for ${MAX_RUNTIME_MINUTES} minutes..."
+            xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24 -ac" node index.js
+          else
+            echo "⚡ Launching single-pass verification & session relogin..."
+            xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24 -ac" node action-runner.js
+          fi

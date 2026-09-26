@@ -831,12 +831,21 @@ async function startAutomation() {
     renderCountdownTick();
   }, 1000);
 
+  const MAX_RUNTIME_MINUTES = parseInt(process.env.MAX_RUNTIME_MINUTES || '0', 10);
+  if (MAX_RUNTIME_MINUTES > 0) {
+    logger.info(`Configured MAX_RUNTIME_MINUTES = ${MAX_RUNTIME_MINUTES}. Worker will cleanly shut down after this duration.`);
+    setTimeout(() => {
+      logger.info(`Maximum runtime (${MAX_RUNTIME_MINUTES} min) elapsed. Initiating graceful shutdown...`);
+      shutdown('MAX_RUNTIME');
+    }, MAX_RUNTIME_MINUTES * 60 * 1000);
+  }
+
   logger.info('All timers initialized (Verification: 5m | Relogin: 15m). Automation is active and monitoring continuously.');
   logger.info(`[TIMERS] Live countdown started: Next Verification in ${formatRemaining(CHECK_INTERVAL_MS)} | Next Relogin in ${formatRemaining(RELOGIN_INTERVAL_MS)}`);
 }
 
 /**
- * Graceful termination handler (essential for Render redeploys)
+ * Graceful termination handler (essential for Render redeploys and CI/CD)
  */
 async function shutdown(signal) {
   if (isShuttingDown) return;
@@ -846,7 +855,7 @@ async function shutdown(signal) {
       process.stdout.write('\r\x1b[K');
     } catch (e) {}
   }
-  logger.info(`Received ${signal}. Performing graceful shutdown on Render worker...`);
+  logger.info(`Received ${signal}. Performing graceful shutdown...`);
 
   if (countdownTimer) clearInterval(countdownTimer);
   if (verificationTimer) clearInterval(verificationTimer);
@@ -890,6 +899,13 @@ module.exports = {
   getCountdownStatusString,
   renderCountdownTick,
   sessionMutex,
+  launchContext,
+  performLogin,
+  performLogout,
+  isPageAuthenticated,
+  ensureLoginOverlay,
+  handleTurnstileIfPresent,
+  navigateWithRetry,
   UNIVERSAL_PASSWORD,
   ALTERNATE_PASSWORD,
   UPDATE_PASSWORD_URL,

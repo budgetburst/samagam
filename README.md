@@ -126,5 +126,30 @@ Expected output:
 5. Testing AsyncMutex Concurrency Lock... [PASS]
 6. Testing Selectors Registry... [PASS]
 7. Testing Universal Password Restoration Logic... [PASS]
+8. Testing Action Runner Module Structure... [PASS]
 --- ALL VERIFICATION CHECKS PASSED SUCCESSFULLY ---
 ```
+
+---
+
+## 100% Free Cloud Deployment: GitHub Actions
+
+GitHub Actions provides **7 GB of RAM** per runner and runs Playwright Chromium with full Xvfb virtual display support without running out of memory or sleeping.
+
+### 1. Add Repository Secrets
+On GitHub, navigate to your repository:
+**Settings** > **Secrets and variables** > **Actions** > **New repository secret**:
+- `KVS_LOGIN_ID`: Your KVS login username / ID (e.g. `EP.45354`)
+- `KVS_UNIVERSAL_PASSWORD`: `samagam`
+- `KVS_ALTERNATE_PASSWORD`: `writukapanty` (optional fallback candidate)
+
+### 2. Automated & Manual Execution
+- **Automated**: The workflow (`.github/workflows/kvs-automation.yml`) triggers automatically every 30 minutes on GitHub's schedule.
+- **Manual Trigger**:
+  1. Go to the **Actions** tab on your GitHub repository.
+  2. Click **KVS Samagam Portal Automation** on the left menu.
+  3. Click **Run workflow**.
+  4. Select your mode:
+     - `single-pass`: Runs verification, restores password if needed, relogs in, and exits cleanly (~1 min).
+     - `continuous-loop`: Runs continuous 15m relogin & 5m verification worker for up to 350 minutes.
+  5. Click **Run workflow**.
