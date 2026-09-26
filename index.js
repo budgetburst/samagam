@@ -231,11 +231,14 @@ async function launchContext(profileDir, profileLabel = 'Default') {
   const launchOptions = {
     headless: HEADLESS,
     viewport: { width: 1366, height: 768 },
+    ignoreHTTPSErrors: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage', // Critical for Docker/Render containers
       '--disable-blink-features=AutomationControlled',
+      '--ignore-certificate-errors',
+      '--allow-running-insecure-content',
       '--window-size=1366,768',
       '--disable-gpu',
     ],
@@ -276,19 +279,50 @@ async function navigateWithRetry(page, url, maxRetries = MAX_RETRIES) {
  * Ensure login overlay modal is open and visible
  */
 async function ensureLoginOverlay(page) {
+  logger.debug(`Ensuring login overlay is active (current URL: ${page.url()})...`);
+
+  // 1. Direct DOM activation: instantly add 'open' class to #lpLoginOverlay and render Turnstile
+  await page.evaluate(() => {
+    const overlay = document.getElementById('lpLoginOverlay');
+    if (overlay) {
+      overlay.classList.add('open');
+      const cf = overlay.querySelector('.cf-turnstile');
+      if (cf && !cf.hasChildNodes() && window.turnstile && typeof window.turnstile.render === 'function') {
+        try { window.turnstile.render(cf); } catch (e) {}
+      }
+      const u = document.getElementById('lpLoginUsername');
+      if (u) u.focus();
+    }
+  }).catch(() => {});
+
   const overlay = page.locator(selectors.login.overlay);
   const isOverlayOpen = await overlay.evaluate(el => el.classList.contains('open')).catch(() => false);
 
   if (!isOverlayOpen) {
     logger.debug('Login overlay is closed; triggering open modal button');
     const openBtn = page.locator(selectors.login.openModalButton).first();
-    if (await openBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await openBtn.click();
+    if (await openBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await openBtn.click({ force: true });
       await overlay.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
     }
+
+    // Force open class again
+    await page.evaluate(() => {
+      const overlay = document.getElementById('lpLoginOverlay');
+      if (overlay) overlay.classList.add('open');
+    }).catch(() => {});
   }
 
-  await page.locator(selectors.login.usernameInput).waitFor({ state: 'visible', timeout: ACTION_TIMEOUT });
+  // Diagnostic wait: if input is still not visible, log page context
+  try {
+    await page.locator(selectors.login.usernameInput).waitFor({ state: 'visible', timeout: ACTION_TIMEOUT });
+  } catch (err) {
+    const pageTitle = await page.title().catch(() => 'unknown');
+    const pageUrl = page.url();
+    const bodySnippet = await page.evaluate(() => (document.body ? document.body.innerText.slice(0, 200).replace(/\s+/g, ' ') : '')).catch(() => '');
+    logger.warn(`Username input wait timeout. Page title: "${pageTitle}" | URL: "${pageUrl}" | Snippet: "${bodySnippet}"`);
+    throw err;
+  }
 }
 
 /**
