@@ -58,7 +58,8 @@ jobs:
 
       - name: Run KVS Automation
         env:
-          KVS_LOGIN_ID: ${{ secrets.KVS_LOGIN_ID }}
+          KVS_LOGIN_IDS: ${{ secrets.KVS_LOGIN_IDS || 'EP.45354,EP.50696,CS.136206' }}
+          KVS_LOGIN_ID: ${{ secrets.KVS_LOGIN_ID || 'EP.45354' }}
           KVS_UNIVERSAL_PASSWORD: ${{ secrets.KVS_UNIVERSAL_PASSWORD || 'samagam' }}
           KVS_ALTERNATE_PASSWORD: ${{ secrets.KVS_ALTERNATE_PASSWORD }}
           CHECK_INTERVAL_MS: '300000'     # Verification cycle: exactly 5 minutes

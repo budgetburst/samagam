@@ -36,7 +36,25 @@ const LOGIN_URL = `${BASE_URL}/user/login`;
 const LOGOUT_URL = `${BASE_URL}/logout`;
 const UPDATE_PASSWORD_URL = `${BASE_URL}/user/update-password`;
 
-const LOGIN_ID = process.env.KVS_LOGIN_ID || 'EP.45354';
+const DEFAULT_LOGIN_IDS = ['EP.45354', 'EP.50696', 'CS.136206'];
+
+function parseLoginIds() {
+  if (process.env.KVS_LOGIN_IDS) {
+    return process.env.KVS_LOGIN_IDS.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+  }
+  if (process.env.KVS_LOGIN_ID) {
+    if (process.env.KVS_LOGIN_ID.includes(',')) {
+      return process.env.KVS_LOGIN_ID.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+    }
+    if (!DEFAULT_LOGIN_IDS.includes(process.env.KVS_LOGIN_ID)) {
+      return [process.env.KVS_LOGIN_ID, ...DEFAULT_LOGIN_IDS];
+    }
+  }
+  return DEFAULT_LOGIN_IDS;
+}
+
+const LOGIN_IDS = parseLoginIds();
+const LOGIN_ID = LOGIN_IDS[0]; // Primary ID for single-account backwards compatibility
 // Universal password baseline (default: samagam)
 const UNIVERSAL_PASSWORD = process.env.KVS_UNIVERSAL_PASSWORD || process.env.KVS_PASSWORD_1 || 'samagam';
 // Optional alternate password candidate (if password was temporarily changed)
@@ -54,7 +72,19 @@ const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
   : path.resolve('./.kvs_render_profile');
 
-// Distinct profiles for the main session and verification checks
+function sanitizeAccountId(id) {
+  return String(id).replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function getMainProfileDir(accountId) {
+  return path.join(DATA_DIR, 'main_profile', sanitizeAccountId(accountId || LOGIN_ID));
+}
+
+function getVerifyProfileDir(accountId) {
+  return path.join(DATA_DIR, 'verify_profile', sanitizeAccountId(accountId || LOGIN_ID));
+}
+
+// Distinct profiles for the main session and verification checks (backward-compatibility aliases)
 const MAIN_PROFILE_DIR = path.join(DATA_DIR, 'main_profile');
 const VERIFY_PROFILE_DIR = path.join(DATA_DIR, 'verify_profile');
 
@@ -67,6 +97,25 @@ const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
 // STATE MACHINE & REPORTERS
 // ==========================================
 let activePassword = UNIVERSAL_PASSWORD;
+
+class AccountSession {
+  constructor(loginId) {
+    this.loginId = loginId;
+    this.safeId = sanitizeAccountId(loginId);
+    this.mainProfileDir = getMainProfileDir(loginId);
+    this.verifyProfileDir = getVerifyProfileDir(loginId);
+    this.mainBrowserContext = null;
+    this.mainPage = null;
+    this.activePassword = UNIVERSAL_PASSWORD;
+    this.lastVerificationResult = { status: 'pending', timestamp: null };
+    this.lastReloginResult = { status: 'pending', timestamp: null };
+  }
+}
+
+const accountSessions = new Map();
+for (const id of LOGIN_IDS) {
+  accountSessions.set(id, new AccountSession(id));
+}
 
 // Global coordination lock between 5m verification and 15m relogin
 const sessionMutex = new AsyncMutex();
@@ -125,7 +174,7 @@ function renderCountdownTick() {
   const rStr = isReloginRunning ? 'in progress...' : formatRemaining(rMs);
   const activeLabel = activePassword === UNIVERSAL_PASSWORD ? 'samagam' : 'custom';
 
-  const tickerMsg = `⏱️  [TIMERS] Verification in: ${vStr} | Relogin in: ${rStr} (Active: ${activeLabel})`;
+  const tickerMsg = `⏱️  [TIMERS] (${LOGIN_IDS.length} accounts: ${LOGIN_IDS.join(', ')}) Verification in: ${vStr} | Relogin in: ${rStr} (Active: ${activeLabel})`;
 
   if (process.stdout && process.stdout.isTTY) {
     process.stdout.write(`\r\x1b[K${tickerMsg}`);
@@ -136,7 +185,7 @@ function renderCountdownTick() {
   if (lastLoggedMilestoneMinute !== currentMinuteFloor) {
     lastLoggedMilestoneMinute = currentMinuteFloor;
     if (!process.stdout || !process.stdout.isTTY) {
-      logger.info(`[TIMERS] Countdown: Verification in ${vStr} | Relogin in ${rStr}`);
+      logger.info(`[TIMERS] Countdown (${LOGIN_IDS.length} accounts: ${LOGIN_IDS.join(', ')}): Verification in ${vStr} | Relogin in ${rStr}`);
     }
   }
 }
@@ -182,6 +231,9 @@ function getAutomationStatus() {
   const now = Date.now();
   const vMs = nextVerificationTime ? Math.max(0, nextVerificationTime - now) : 0;
   const rMs = nextReloginTime ? Math.max(0, nextReloginTime - now) : 0;
+  const anyBrowserActive = Array.from(accountSessions.values()).some(
+    s => s.mainBrowserContext !== null && s.mainPage !== null && !s.mainPage.isClosed()
+  );
 
   return {
     uptimeSeconds: startTime ? Math.floor((Date.now() - startTime) / 1000) : 0,
@@ -189,7 +241,18 @@ function getAutomationStatus() {
     universalPassword: 'samagam',
     updatePasswordUrl: UPDATE_PASSWORD_URL,
     isMutexLocked: sessionMutex.isLocked(),
-    isBrowserActive: mainBrowserContext !== null && mainPage !== null && !mainPage.isClosed(),
+    isBrowserActive: anyBrowserActive,
+    accounts: LOGIN_IDS.map(id => {
+      const s = accountSessions.get(id);
+      return {
+        loginId: id,
+        activePassword: s ? (s.activePassword === UNIVERSAL_PASSWORD ? 'samagam' : 'custom') : 'samagam',
+        isBrowserActive: !!(s && s.mainBrowserContext && s.mainPage && !s.mainPage.isClosed()),
+        lastVerification: s ? s.lastVerificationResult : null,
+        lastRelogin: s ? s.lastReloginResult : null,
+      };
+    }),
+    loginIds: LOGIN_IDS,
     profiles: {
       mainProfile: MAIN_PROFILE_DIR,
       verifyProfile: VERIFY_PROFILE_DIR,
@@ -400,17 +463,19 @@ async function handleTurnstileIfPresent(page) {
  * Perform login attempt on a given page
  * @returns {Promise<{ success: boolean, reason?: string }>}
  */
-async function performLogin(page, passwordToUse) {
+async function performLogin(page, passwordToUse, loginId) {
+  const targetLoginId = loginId || LOGIN_ID;
   try {
     await navigateWithRetry(page, LOGIN_URL);
     await ensureLoginOverlay(page);
 
+    logger.info(`Entering credentials for ${targetLoginId}...`);
     // Human-paced typing to prevent bot telemetry flags
     const userField = page.locator(selectors.login.usernameInput);
     await userField.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT });
     await userField.click();
     await userField.fill('');
-    await userField.pressSequentially(LOGIN_ID, { delay: 40 });
+    await userField.pressSequentially(targetLoginId, { delay: 40 });
 
     await new Promise(r => setTimeout(r, 200));
 
@@ -438,11 +503,11 @@ async function performLogin(page, passwordToUse) {
       pass: document.querySelector('#lpLoginPassword')?.value,
     })).catch(() => ({}));
 
-    if (!domValues.user || domValues.user !== LOGIN_ID) {
-      logger.debug('Re-applying username before submission...');
+    if (!domValues.user || domValues.user !== targetLoginId) {
+      logger.debug(`Re-applying username (${targetLoginId}) before submission...`);
       await userField.click();
       await userField.fill('');
-      await userField.pressSequentially(LOGIN_ID, { delay: 30 });
+      await userField.pressSequentially(targetLoginId, { delay: 30 });
     }
 
     if (!domValues.pass || domValues.pass !== passwordToUse) {
@@ -455,7 +520,7 @@ async function performLogin(page, passwordToUse) {
     // Brief stabilization pause before form submit
     await new Promise(r => setTimeout(r, 600));
 
-    logger.debug('Submitting login credentials');
+    logger.debug(`Submitting login credentials for ${targetLoginId}`);
     const submitBtn = page.locator(selectors.login.submitButton);
     await submitBtn.click();
 
@@ -568,10 +633,12 @@ async function performLogout(page) {
  *
  * @param {Page} page - The main authenticated page
  * @param {string} [candidateOldPassword] - Candidate current password if known
+ * @param {string} [loginId] - Login ID being restored
  * @returns {Promise<boolean>}
  */
-async function restorePasswordToUniversal(page, candidateOldPassword) {
-  logger.warn(`Restoring portal password back to universal password (${UNIVERSAL_PASSWORD}) from logged-in profile...`);
+async function restorePasswordToUniversal(page, candidateOldPassword, loginId) {
+  const targetLoginId = loginId || LOGIN_ID;
+  logger.warn(`Restoring portal password back to universal password (${UNIVERSAL_PASSWORD}) for ${targetLoginId} from logged-in profile...`);
   logger.info(`Navigating directly to: ${UPDATE_PASSWORD_URL}`);
 
   try {
@@ -589,7 +656,7 @@ async function restorePasswordToUniversal(page, candidateOldPassword) {
     // Determine old password to provide
     const oldPasswordToTry = candidateOldPassword || ALTERNATE_PASSWORD || UNIVERSAL_PASSWORD;
 
-    logger.info(`Entering current credential and restoring new password to universal password (${UNIVERSAL_PASSWORD})...`);
+    logger.info(`Entering current credential and restoring new password to universal password (${UNIVERSAL_PASSWORD}) for ${targetLoginId}...`);
     await currentPassInput.fill('');
     await currentPassInput.fill(oldPasswordToTry);
 
@@ -600,7 +667,7 @@ async function restorePasswordToUniversal(page, candidateOldPassword) {
     await confPassInput.fill(UNIVERSAL_PASSWORD);
 
     // 3. Submit change request
-    logger.info('Submitting password update request to portal...');
+    logger.info(`Submitting password update request to portal for ${targetLoginId}...`);
     await submitBtn.click();
 
     // 4. Verify website reports successful password modification
@@ -618,26 +685,28 @@ async function restorePasswordToUniversal(page, candidateOldPassword) {
     });
 
     if (!isSuccess) {
-      logger.error('Failed to confirm password restoration on the portal.');
+      logger.error(`Failed to confirm password restoration on the portal for ${targetLoginId}.`);
       return false;
     }
 
-    logger.info(`Portal reported successful password modification!`);
+    logger.info(`Portal reported successful password modification for ${targetLoginId}!`);
 
     // 5. Conduct mandatory independent verification in separate verification profile using UNIVERSAL_PASSWORD
-    logger.info(`Conducting mandatory independent verification for universal password (${UNIVERSAL_PASSWORD}) using separate verification profile...`);
-    const verification = await verifyInSeparateProfile(UNIVERSAL_PASSWORD);
+    logger.info(`Conducting mandatory independent verification for ${targetLoginId} with universal password (${UNIVERSAL_PASSWORD})...`);
+    const verification = await verifyInSeparateProfile(UNIVERSAL_PASSWORD, targetLoginId);
 
     if (verification.success) {
+      const session = accountSessions.get(targetLoginId);
+      if (session) session.activePassword = UNIVERSAL_PASSWORD;
       activePassword = UNIVERSAL_PASSWORD;
-      logger.info(`Independent verification succeeded! Password is now confirmed as universal password (${UNIVERSAL_PASSWORD}).`);
+      logger.info(`Independent verification succeeded! Password for ${targetLoginId} is confirmed as universal password (${UNIVERSAL_PASSWORD}).`);
       return true;
     } else {
-      logger.error(`Independent verification for universal password failed: ${verification.reason}`);
+      logger.error(`Independent verification for ${targetLoginId} with universal password failed: ${verification.reason}`);
       return false;
     }
   } catch (err) {
-    logger.error(`Error during password restoration workflow: ${err.message}`);
+    logger.error(`Error during password restoration workflow for ${targetLoginId}: ${err.message}`);
     return false;
   }
 }
@@ -649,87 +718,102 @@ async function restorePasswordToUniversal(page, candidateOldPassword) {
 /**
  * Perform verification attempt using a completely separate browser profile.
  * Does not share cookies, storage, or session state with the main logged-in profile.
+ * @param {string} passwordToTest
+ * @param {string} [loginId]
  * @returns {Promise<{ success: boolean, reason?: string }>}
  */
-async function verifyInSeparateProfile(passwordToTest) {
+async function verifyInSeparateProfile(passwordToTest, loginId) {
+  const targetLoginId = loginId || LOGIN_ID;
+  const profileDir = getVerifyProfileDir(targetLoginId);
   let verifyContext = null;
   try {
-    logger.info(`Opening isolated verification browser profile (${VERIFY_PROFILE_DIR})...`);
-    verifyContext = await launchContext(VERIFY_PROFILE_DIR, 'Verification Profile');
+    logger.info(`Opening isolated verification browser profile for ${targetLoginId} (${profileDir})...`);
+    verifyContext = await launchContext(profileDir, `Verification Profile (${targetLoginId})`);
 
     const pages = verifyContext.pages();
     const verifyPage = pages.length > 0 ? pages[0] : await verifyContext.newPage();
 
-    const result = await performLogin(verifyPage, passwordToTest);
+    const result = await performLogin(verifyPage, passwordToTest, targetLoginId);
     return result;
   } catch (err) {
-    return { success: false, reason: `Verification profile error: ${err.message}` };
+    return { success: false, reason: `Verification profile error for ${targetLoginId}: ${err.message}` };
   } finally {
     if (verifyContext) {
       await verifyContext.close().catch(() => {});
-      logger.debug('Verification browser profile closed cleanly.');
+      logger.debug(`Verification browser profile for ${targetLoginId} closed cleanly.`);
     }
   }
 }
 
 /**
  * 5-Minute verification cycle handler
- * Checks if portal still authenticates with universal password (samagam).
+ * Checks if portal still authenticates with universal password (samagam) for all accounts.
  * If password was changed and verification fails, restores password back to samagam from logged-in profile.
  */
 async function runVerificationCycle() {
   if (isShuttingDown) return;
 
-  logger.info(`[5-Min Cycle] Running independent verification in separate profile for universal password (${UNIVERSAL_PASSWORD})...`);
+  isVerificationRunning = true;
+  logger.info(`[5-Min Cycle] Running independent verification for all ${LOGIN_IDS.length} accounts: [${LOGIN_IDS.join(', ')}]...`);
   const unlock = await sessionMutex.acquire();
 
   try {
-    // 1. Ensure main logged-in page reference is valid
-    if (!mainPage || mainPage.isClosed()) {
-      logger.warn('Main logged-in session page closed or crashed. Re-establishing main session...');
-      mainPage = await mainBrowserContext.newPage();
-      const loginRes = await performLogin(mainPage, activePassword);
-      if (!loginRes.success) {
-        logger.error(`Failed to re-establish main session: ${loginRes.reason}`);
+    for (const session of accountSessions.values()) {
+      if (isShuttingDown) break;
+      const accountId = session.loginId;
+      logger.info(`[5-Min Cycle] Verifying account ${accountId} with universal password (${UNIVERSAL_PASSWORD})...`);
+
+      // 1. Ensure main logged-in page reference is valid
+      if (!session.mainPage || session.mainPage.isClosed()) {
+        logger.warn(`Main logged-in page for ${accountId} closed or uninitialized. Re-establishing...`);
+        if (!session.mainBrowserContext) {
+          session.mainBrowserContext = await launchContext(session.mainProfileDir, `Main Profile (${accountId})`);
+        }
+        session.mainPage = await session.mainBrowserContext.newPage();
+        const loginRes = await performLogin(session.mainPage, session.activePassword, accountId);
+        if (!loginRes.success) {
+          logger.error(`Failed to re-establish main session for ${accountId}: ${loginRes.reason}`);
+        }
       }
-      return;
-    }
 
-    // 2. Attempt verification with universal password in separate verification profile
-    const verificationResult = await verifyInSeparateProfile(UNIVERSAL_PASSWORD);
-    lastVerificationResult = {
-      status: verificationResult.success ? 'success' : 'failed',
-      reason: verificationResult.reason || null,
-      timestamp: new Date().toISOString()
-    };
+      // 2. Attempt verification with universal password in separate verification profile
+      const verificationResult = await verifyInSeparateProfile(UNIVERSAL_PASSWORD, accountId);
+      session.lastVerificationResult = {
+        status: verificationResult.success ? 'success' : 'failed',
+        reason: verificationResult.reason || null,
+        timestamp: new Date().toISOString()
+      };
+      lastVerificationResult = session.lastVerificationResult;
 
-    if (verificationResult.success) {
-      logger.info(`[5-Min Cycle] Verification successful. Universal password (${UNIVERSAL_PASSWORD}) is valid on the portal.`);
-      activePassword = UNIVERSAL_PASSWORD;
-      return;
-    }
+      if (verificationResult.success) {
+        logger.info(`[5-Min Cycle] Verification successful for ${accountId}. Universal password (${UNIVERSAL_PASSWORD}) is valid on the portal.`);
+        session.activePassword = UNIVERSAL_PASSWORD;
+        continue;
+      }
 
-    const isPasswordError = isIncorrectPasswordError(verificationResult.reason);
-    logger.warn(`[5-Min Cycle] Verification failed for universal password (${UNIVERSAL_PASSWORD}): ${verificationResult.reason} (isIncorrectPassword: ${isPasswordError})`);
+      const isPasswordError = isIncorrectPasswordError(verificationResult.reason);
+      logger.warn(`[5-Min Cycle] Verification failed for ${accountId}: ${verificationResult.reason} (isIncorrectPassword: ${isPasswordError})`);
 
-    // 3. If password was changed and verification fails, change it back to samagam from logged-in profile
-    if (isPasswordError) {
-      const mainStillAuthenticated = await isPageAuthenticated(mainPage);
-      logger.info(`Checking logged-in profile status: ${mainStillAuthenticated ? 'STILL AUTHENTICATED' : 'UNAUTHENTICATED'}`);
+      // 3. If password was changed and verification fails, change it back to samagam from logged-in profile
+      if (isPasswordError) {
+        const mainStillAuthenticated = await isPageAuthenticated(session.mainPage);
+        logger.info(`Checking logged-in profile status for ${accountId}: ${mainStillAuthenticated ? 'STILL AUTHENTICATED' : 'UNAUTHENTICATED'}`);
 
-      if (mainStillAuthenticated) {
-        logger.warn(`Password was changed away from universal password! Initiating password restore to ${UNIVERSAL_PASSWORD} from logged-in profile...`);
-        const restored = await restorePasswordToUniversal(mainPage, ALTERNATE_PASSWORD);
-        if (restored) {
-          logger.info(`Password successfully restored back to universal password (${UNIVERSAL_PASSWORD})!`);
+        if (mainStillAuthenticated) {
+          logger.warn(`Password was changed away from universal password for ${accountId}! Initiating password restore to ${UNIVERSAL_PASSWORD} from logged-in profile...`);
+          const restored = await restorePasswordToUniversal(session.mainPage, ALTERNATE_PASSWORD, accountId);
+          if (restored) {
+            session.activePassword = UNIVERSAL_PASSWORD;
+            logger.info(`Password successfully restored back to universal password (${UNIVERSAL_PASSWORD}) for ${accountId}!`);
+          } else {
+            logger.error(`Failed to restore password back to universal password for ${accountId}.`);
+          }
         } else {
-          logger.error(`Failed to restore password back to universal password.`);
+          logger.error(`Main session has expired for ${accountId}. Cannot restore password without an active session.`);
         }
       } else {
-        logger.error('Main session has expired or unauthenticated. Cannot restore password from logged-in profile without an active session.');
+        logger.warn(`[5-Min Cycle] Failure reason for ${accountId} was not an incorrect password error (likely transient/network). Skipping password restore.`);
       }
-    } else {
-      logger.warn(`[5-Min Cycle] Failure reason was not an incorrect password error (likely transient/network). Skipping password restore.`);
     }
   } catch (err) {
     logger.error(`[5-Min Cycle] Unexpected error in verification cycle: ${err.message}`);
@@ -737,45 +821,55 @@ async function runVerificationCycle() {
   } finally {
     isVerificationRunning = false;
     nextVerificationTime = Date.now() + CHECK_INTERVAL_MS;
-    logger.info(`[TIMERS] Verification cycle concluded. Next check in ${formatRemaining(CHECK_INTERVAL_MS)} | Next relogin in ${formatRemaining(nextReloginTime ? nextReloginTime - Date.now() : 0)}`);
+    logger.info(`[TIMERS] Verification cycle concluded for all accounts. Next check in ${formatRemaining(CHECK_INTERVAL_MS)} | Next relogin in ${formatRemaining(nextReloginTime ? nextReloginTime - Date.now() : 0)}`);
     unlock();
   }
 }
 
 /**
- * 15-Minute logout/login cycle handler (runs on main profile using universal password)
+ * 15-Minute logout/login cycle handler (runs on main profile using universal password for all accounts)
  */
 async function runReloginCycle() {
   if (isShuttingDown) return;
 
   isReloginRunning = true;
-  logger.info('[15-Min Cycle] Starting mandatory 15-minute logout/login cycle on main profile...');
+  logger.info(`[15-Min Cycle] Starting mandatory 15-minute logout/login cycle for all ${LOGIN_IDS.length} accounts: [${LOGIN_IDS.join(', ')}]...`);
   const unlock = await sessionMutex.acquire();
 
   try {
-    // 1. Ensure main page reference is valid in main profile
-    if (!mainPage || mainPage.isClosed()) {
-      mainPage = await mainBrowserContext.newPage();
-    }
+    for (const session of accountSessions.values()) {
+      if (isShuttingDown) break;
+      const accountId = session.loginId;
+      logger.info(`[15-Min Cycle] Processing relogin for ${accountId}...`);
 
-    // 2. Perform actual Logout on main logged-in page
-    await performLogout(mainPage);
+      if (!session.mainBrowserContext) {
+        session.mainBrowserContext = await launchContext(session.mainProfileDir, `Main Profile (${accountId})`);
+      }
+      if (!session.mainPage || session.mainPage.isClosed()) {
+        const pages = session.mainBrowserContext.pages();
+        session.mainPage = pages.length > 0 ? pages[0] : await session.mainBrowserContext.newPage();
+      }
 
-    // 3. Attempt login with universal password
-    logger.info(`[15-Min Cycle] Attempting relogin using universal password (${UNIVERSAL_PASSWORD})...`);
-    const loginResult = await performLogin(mainPage, UNIVERSAL_PASSWORD);
+      // 1. Perform actual Logout on main logged-in page
+      await performLogout(session.mainPage);
 
-    lastReloginResult = {
-      status: loginResult.success ? 'success' : 'failed',
-      reason: loginResult.reason || null,
-      timestamp: new Date().toISOString()
-    };
+      // 2. Attempt login with universal password
+      logger.info(`[15-Min Cycle] Attempting relogin for ${accountId} using universal password (${UNIVERSAL_PASSWORD})...`);
+      const loginResult = await performLogin(session.mainPage, UNIVERSAL_PASSWORD, accountId);
 
-    if (loginResult.success) {
-      activePassword = UNIVERSAL_PASSWORD;
-      logger.info(`[15-Min Cycle] Relogin successful using universal password (${UNIVERSAL_PASSWORD}). Main profile session reference refreshed.`);
-    } else {
-      logger.error(`[15-Min Cycle] Relogin could not be completed with universal password: ${loginResult.reason}`);
+      session.lastReloginResult = {
+        status: loginResult.success ? 'success' : 'failed',
+        reason: loginResult.reason || null,
+        timestamp: new Date().toISOString()
+      };
+      lastReloginResult = session.lastReloginResult;
+
+      if (loginResult.success) {
+        session.activePassword = UNIVERSAL_PASSWORD;
+        logger.info(`[15-Min Cycle] Relogin successful for ${accountId} using universal password (${UNIVERSAL_PASSWORD}).`);
+      } else {
+        logger.error(`[15-Min Cycle] Relogin could not be completed for ${accountId} with universal password: ${loginResult.reason}`);
+      }
     }
   } catch (err) {
     logger.error(`[15-Min Cycle] Unexpected error during relogin cycle: ${err.message}`);
@@ -783,7 +877,7 @@ async function runReloginCycle() {
   } finally {
     isReloginRunning = false;
     nextReloginTime = Date.now() + RELOGIN_INTERVAL_MS;
-    logger.info(`[TIMERS] Relogin cycle concluded. Next relogin in ${formatRemaining(RELOGIN_INTERVAL_MS)} | Next verification in ${formatRemaining(nextVerificationTime ? nextVerificationTime - Date.now() : 0)}`);
+    logger.info(`[TIMERS] Relogin cycle concluded for all accounts. Next relogin in ${formatRemaining(RELOGIN_INTERVAL_MS)} | Next verification in ${formatRemaining(nextVerificationTime ? nextVerificationTime - Date.now() : 0)}`);
     unlock();
   }
 }
@@ -795,52 +889,52 @@ async function runReloginCycle() {
 async function startAutomation() {
   startTime = Date.now();
   logger.info('========================================================');
-  logger.info('Starting KVS Samagam Continuous Automation Engine (Render)');
+  logger.info('Starting KVS Samagam Continuous Automation Engine');
   logger.info(`Target URL: ${BASE_URL}`);
-  logger.info(`Login ID: ${LOGIN_ID}`);
+  logger.info(`Active Accounts (${LOGIN_IDS.length}): ${LOGIN_IDS.join(', ')}`);
   logger.info(`Universal Password: ${UNIVERSAL_PASSWORD}`);
   logger.info(`Password Update URL: ${UPDATE_PASSWORD_URL}`);
-  logger.info(`Main Profile: ${MAIN_PROFILE_DIR}`);
-  logger.info(`Verification Profile: ${VERIFY_PROFILE_DIR}`);
-  logger.info(`Verification Interval: ${CHECK_INTERVAL_MS / 1000}s | Relogin Interval: ${RELOGIN_INTERVAL_MS / 1000}s (15m)`);
+  logger.info(`Root Data Directory: ${DATA_DIR}`);
+  logger.info(`Verification Interval: ${CHECK_INTERVAL_MS / 1000}s (5m) | Relogin Interval: ${RELOGIN_INTERVAL_MS / 1000}s (15m)`);
   logger.info('========================================================');
 
-  // Launch main browser context for continuous logged-in session
-  mainBrowserContext = await launchContext(MAIN_PROFILE_DIR, 'Main Logged-In Profile');
-
-  // Create initial main page
-  const pages = mainBrowserContext.pages();
-  mainPage = pages.length > 0 ? pages[0] : await mainBrowserContext.newPage();
-
-  // Acquire lock for initial login
   const unlock = await sessionMutex.acquire();
   try {
-    logger.info(`Attempting initial login on main page with universal password (${UNIVERSAL_PASSWORD})...`);
-    let initialLogin = await performLogin(mainPage, UNIVERSAL_PASSWORD);
+    for (const session of accountSessions.values()) {
+      const accountId = session.loginId;
+      logger.info(`Initializing main browser context for ${accountId}...`);
+      session.mainBrowserContext = await launchContext(session.mainProfileDir, `Main Profile (${accountId})`);
 
-    // If initial login encountered a transient error (e.g. Turnstile timing or network), retry once cleanly with universal password
-    if (!initialLogin.success && !isIncorrectPasswordError(initialLogin.reason)) {
-      logger.warn(`Initial attempt encountered transient issue: ${initialLogin.reason}. Retrying cleanly in 3s with universal password...`);
-      await new Promise(r => setTimeout(r, 3000));
-      initialLogin = await performLogin(mainPage, UNIVERSAL_PASSWORD);
-    }
+      const pages = session.mainBrowserContext.pages();
+      session.mainPage = pages.length > 0 ? pages[0] : await session.mainBrowserContext.newPage();
 
-    // If initial login genuinely returned credential failure, check alternate password candidate to restore back to universal password
-    if (!initialLogin.success && isIncorrectPasswordError(initialLogin.reason) && ALTERNATE_PASSWORD) {
-      logger.warn(`Universal password failed with credential mismatch: ${initialLogin.reason}. Checking alternate candidate...`);
-      const altLogin = await performLogin(mainPage, ALTERNATE_PASSWORD);
-      if (altLogin.success) {
-        logger.info(`Logged in with alternate password. Automatically restoring password to universal password (${UNIVERSAL_PASSWORD})...`);
-        await restorePasswordToUniversal(mainPage, ALTERNATE_PASSWORD);
-        initialLogin = altLogin;
+      logger.info(`Attempting initial login for ${accountId} on main page with universal password (${UNIVERSAL_PASSWORD})...`);
+      let initialLogin = await performLogin(session.mainPage, UNIVERSAL_PASSWORD, accountId);
+
+      // Transient retry
+      if (!initialLogin.success && !isIncorrectPasswordError(initialLogin.reason)) {
+        logger.warn(`Initial attempt for ${accountId} encountered transient issue: ${initialLogin.reason}. Retrying cleanly in 3s with universal password...`);
+        await new Promise(r => setTimeout(r, 3000));
+        initialLogin = await performLogin(session.mainPage, UNIVERSAL_PASSWORD, accountId);
       }
-    }
 
-    if (!initialLogin.success) {
-      logger.warn(`Initial login failed: ${initialLogin.reason}`);
-      logger.error('CRITICAL: Initial login could not be completed. Automation will maintain session loop and retry on scheduled intervals.');
-    } else {
-      logger.info('Initial authentication successful. Main logged-in session established and referenced.');
+      // Alternate password check if credential mismatch
+      if (!initialLogin.success && isIncorrectPasswordError(initialLogin.reason) && ALTERNATE_PASSWORD) {
+        logger.warn(`Universal password failed for ${accountId} with credential mismatch: ${initialLogin.reason}. Checking alternate candidate...`);
+        const altLogin = await performLogin(session.mainPage, ALTERNATE_PASSWORD, accountId);
+        if (altLogin.success) {
+          logger.info(`Logged in ${accountId} with alternate password. Automatically restoring password to universal password (${UNIVERSAL_PASSWORD})...`);
+          await restorePasswordToUniversal(session.mainPage, ALTERNATE_PASSWORD, accountId);
+          initialLogin = altLogin;
+        }
+      }
+
+      if (!initialLogin.success) {
+        logger.warn(`Initial login failed for ${accountId}: ${initialLogin.reason}`);
+        logger.error(`Initial login could not be completed for ${accountId}. Automation will maintain session loop and retry on scheduled intervals.`);
+      } else {
+        logger.info(`Initial authentication successful for ${accountId}. Main logged-in session established.`);
+      }
     }
   } finally {
     unlock();
@@ -850,12 +944,12 @@ async function startAutomation() {
   nextVerificationTime = Date.now() + CHECK_INTERVAL_MS;
   nextReloginTime = Date.now() + RELOGIN_INTERVAL_MS;
 
-  // Setup periodic 5-minute verification interval (runs in separate verification profile)
+  // Setup periodic 5-minute verification interval
   verificationTimer = setInterval(() => {
     runVerificationCycle().catch(err => logger.error(`Verification interval error: ${err.message}`));
   }, CHECK_INTERVAL_MS);
 
-  // Setup periodic 15-minute logout/login interval (runs on main logged-in profile)
+  // Setup periodic 15-minute logout/login interval
   reloginTimer = setInterval(() => {
     runReloginCycle().catch(err => logger.error(`Relogin interval error: ${err.message}`));
   }, RELOGIN_INTERVAL_MS);
@@ -874,7 +968,7 @@ async function startAutomation() {
     }, MAX_RUNTIME_MINUTES * 60 * 1000);
   }
 
-  logger.info('All timers initialized (Verification: 5m | Relogin: 15m). Automation is active and monitoring continuously.');
+  logger.info(`All timers initialized (Verification: 5m | Relogin: 15m) for all accounts (${LOGIN_IDS.join(', ')}). Automation is active and monitoring continuously.`);
   logger.info(`[TIMERS] Live countdown started: Next Verification in ${formatRemaining(CHECK_INTERVAL_MS)} | Next Relogin in ${formatRemaining(RELOGIN_INTERVAL_MS)}`);
 }
 
@@ -889,19 +983,21 @@ async function shutdown(signal) {
       process.stdout.write('\r\x1b[K');
     } catch (e) {}
   }
-  logger.info(`Received ${signal}. Performing graceful shutdown...`);
+  logger.info(`Received ${signal}. Performing graceful shutdown for ${LOGIN_IDS.length} accounts...`);
 
   if (countdownTimer) clearInterval(countdownTimer);
   if (verificationTimer) clearInterval(verificationTimer);
   if (reloginTimer) clearInterval(reloginTimer);
 
-  try {
-    if (mainBrowserContext) {
-      logger.info('Closing main browser context and preserving profile state...');
-      await mainBrowserContext.close();
+  for (const session of accountSessions.values()) {
+    try {
+      if (session.mainBrowserContext) {
+        logger.info(`Closing main browser context for ${session.loginId} and preserving profile state...`);
+        await session.mainBrowserContext.close();
+      }
+    } catch (err) {
+      logger.error(`Error while closing browser context for ${session.loginId}: ${err.message}`);
     }
-  } catch (err) {
-    logger.error(`Error while closing main browser context: ${err.message}`);
   }
 
   logger.info('Shutdown complete.');
@@ -940,9 +1036,14 @@ module.exports = {
   ensureLoginOverlay,
   handleTurnstileIfPresent,
   navigateWithRetry,
+  getMainProfileDir,
+  getVerifyProfileDir,
+  LOGIN_IDS,
+  LOGIN_ID,
   UNIVERSAL_PASSWORD,
   ALTERNATE_PASSWORD,
   UPDATE_PASSWORD_URL,
   MAIN_PROFILE_DIR,
   VERIFY_PROFILE_DIR,
+  accountSessions,
 };

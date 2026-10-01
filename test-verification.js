@@ -13,6 +13,9 @@ const {
   UPDATE_PASSWORD_URL,
   MAIN_PROFILE_DIR,
   VERIFY_PROFILE_DIR,
+  LOGIN_IDS,
+  getMainProfileDir,
+  getVerifyProfileDir,
 } = require('./index');
 
 // Set dummy sensitive credentials for testing
@@ -47,6 +50,22 @@ assert.notStrictEqual(MAIN_PROFILE_DIR, VERIFY_PROFILE_DIR, 'Main and verificati
 console.log(`   [PASS] Main Profile: ${MAIN_PROFILE_DIR}`);
 console.log(`   [PASS] Verify Profile: ${VERIFY_PROFILE_DIR}`);
 console.log('   [PASS] Separate profiles guaranteed for logged-in session and verification.');
+
+// 3b. Verify Multi-Account Configuration
+console.log('3b. Testing Multi-Account Configuration & Directory Paths...');
+assert(Array.isArray(LOGIN_IDS), 'LOGIN_IDS is not an array');
+assert(LOGIN_IDS.includes('EP.45354'), 'Missing EP.45354 in LOGIN_IDS');
+assert(LOGIN_IDS.includes('EP.50696'), 'Missing EP.50696 in LOGIN_IDS');
+assert(LOGIN_IDS.includes('CS.136206'), 'Missing CS.136206 in LOGIN_IDS');
+
+const dir1 = getMainProfileDir('EP.45354');
+const dir2 = getMainProfileDir('EP.50696');
+const dir3 = getMainProfileDir('CS.136206');
+assert.notStrictEqual(dir1, dir2, 'Profile dirs for EP.45354 and EP.50696 collided!');
+assert.notStrictEqual(dir2, dir3, 'Profile dirs for EP.50696 and CS.136206 collided!');
+assert.notStrictEqual(dir1, dir3, 'Profile dirs for EP.45354 and CS.136206 collided!');
+console.log(`   [PASS] Multi-account support verified: [${LOGIN_IDS.join(', ')}]`);
+console.log('   [PASS] Dedicated isolated profile paths guaranteed for each account.');
 
 // 4. Verify Incorrect Password Error Classification
 console.log('4. Testing Incorrect Password Error Parser...');
