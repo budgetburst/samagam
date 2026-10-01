@@ -24,7 +24,6 @@ on:
 permissions:
   contents: write
   actions: write
-  workflows: write
 
 concurrency:
   group: kvs-samagam-workflow
