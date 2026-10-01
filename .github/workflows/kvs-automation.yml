@@ -1,8 +1,7 @@
-name: KVS Samagam Portal Automation
+name: KVS Samagam Multi-Account Automation
 
 on:
-  # Automated schedule: runs every 30 minutes to maintain 24/7 continuous session
-  # Each run executes 6x 5-minute verifications and 2x 15-minute relogins
+  # Automated schedule: keeps fresh runs constantly queued and running 24/7
   schedule:
     - cron: '*/30 * * * *'
 
@@ -18,17 +17,25 @@ on:
           - 'continuous-loop'
           - 'single-pass'
       duration_minutes:
-        description: 'Duration (in minutes) for continuous loop (max 350)'
+        description: 'Duration (in minutes) per stage (default: 340)'
         required: false
-        default: '350'
+        default: '340'
+
+permissions:
+  contents: write
+  actions: write
+  workflows: write
 
 concurrency:
   group: kvs-samagam-workflow
   cancel-in-progress: false
 
 jobs:
-  run-automation:
-    name: Run KVS Automation Worker
+  # ====================================================================
+  # STAGE 1 (Hours 0 - 5.6)
+  # ====================================================================
+  worker-stage-1:
+    name: Continuous Worker (Stage 1)
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -46,8 +53,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .kvs_render_profile
-          key: kvs-profile-${{ runner.os }}-${{ github.run_id }}
+          key: kvs-profile-${{ runner.os }}-${{ github.run_id }}-1
           restore-keys: |
+            kvs-profile-${{ runner.os }}-${{ github.run_id }}-
             kvs-profile-${{ runner.os }}-
 
       - name: Install Node dependencies
@@ -58,9 +66,9 @@ jobs:
 
       - name: Run KVS Automation
         env:
-          KVS_LOGIN_IDS: ${{ secrets.KVS_LOGIN_IDS || 'EP.45354,EP.50696,CS.136206' }}
-          KVS_LOGIN_ID: ${{ secrets.KVS_LOGIN_ID || 'EP.45354' }}
-          KVS_UNIVERSAL_PASSWORD: ${{ secrets.KVS_UNIVERSAL_PASSWORD || 'samagam' }}
+          KVS_LOGIN_IDS: ${{ secrets.KVS_LOGIN_IDS }}
+          KVS_LOGIN_ID: ${{ secrets.KVS_LOGIN_ID }}
+          KVS_UNIVERSAL_PASSWORD: ${{ secrets.KVS_UNIVERSAL_PASSWORD }}
           KVS_ALTERNATE_PASSWORD: ${{ secrets.KVS_ALTERNATE_PASSWORD }}
           CHECK_INTERVAL_MS: '300000'     # Verification cycle: exactly 5 minutes
           RELOGIN_INTERVAL_MS: '900000'   # Relogin cycle: exactly 15 minutes
@@ -73,11 +81,10 @@ jobs:
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             MODE="${INPUT_MODE:-continuous-loop}"
-            MAX_RUNTIME_MINUTES="${INPUT_DURATION:-350}"
+            MAX_RUNTIME_MINUTES="${INPUT_DURATION:-340}"
           else
-            # Automated 30-minute blocks (executing 5m verifications and 15m relogins non-stop)
             MODE="${SECRET_SCHEDULE_MODE:-continuous-loop}"
-            MAX_RUNTIME_MINUTES="${SECRET_SCHEDULE_DURATION:-30}"
+            MAX_RUNTIME_MINUTES="${SECRET_SCHEDULE_DURATION:-340}"
           fi
 
           export MODE MAX_RUNTIME_MINUTES CHECK_INTERVAL_MS RELOGIN_INTERVAL_MS
@@ -89,3 +96,230 @@ jobs:
             echo "⚡ Launching single-pass verification & session relogin..."
             xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24 -ac" node action-runner.js
           fi
+
+      - name: Auto-dispatch Next Workflow Run
+        if: always() && github.event.inputs.mode != 'single-pass'
+        env:
+          GH_TOKEN: ${{ secrets.ACTIONS_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Attempting to auto-dispatch fresh workflow run..."
+          gh workflow run kvs-automation.yml -r main -f mode=continuous-loop -f duration_minutes=340 || \
+          curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/kvs-automation.yml/dispatches \
+            -d '{"ref":"main","inputs":{"mode":"continuous-loop","duration_minutes":"340"}}' || \
+          echo "Auto-dispatch cycle complete."
+
+  # ====================================================================
+  # STAGE 2 (Hours 5.6 - 11.3)
+  # Automatically starts fresh VM when Stage 1 completes
+  # ====================================================================
+  worker-stage-2:
+    name: Continuous Worker (Stage 2)
+    needs: worker-stage-1
+    if: always() && github.event.inputs.mode != 'single-pass'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Restore browser session cache
+        uses: actions/cache@v4
+        with:
+          path: .kvs_render_profile
+          key: kvs-profile-${{ runner.os }}-${{ github.run_id }}-2
+          restore-keys: |
+            kvs-profile-${{ runner.os }}-${{ github.run_id }}-
+            kvs-profile-${{ runner.os }}-
+
+      - name: Install Node dependencies
+        run: npm ci || npm install
+
+      - name: Install Playwright & OS dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Run KVS Automation
+        env:
+          KVS_LOGIN_IDS: ${{ secrets.KVS_LOGIN_IDS }}
+          KVS_LOGIN_ID: ${{ secrets.KVS_LOGIN_ID }}
+          KVS_UNIVERSAL_PASSWORD: ${{ secrets.KVS_UNIVERSAL_PASSWORD }}
+          KVS_ALTERNATE_PASSWORD: ${{ secrets.KVS_ALTERNATE_PASSWORD }}
+          CHECK_INTERVAL_MS: '300000'
+          RELOGIN_INTERVAL_MS: '900000'
+          HEADLESS: 'false'
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_DURATION: ${{ github.event.inputs.duration_minutes }}
+          SECRET_SCHEDULE_MODE: ${{ secrets.SCHEDULE_MODE }}
+          SECRET_SCHEDULE_DURATION: ${{ secrets.SCHEDULE_DURATION_MINUTES }}
+        run: |
+          MODE="continuous-loop"
+          MAX_RUNTIME_MINUTES="${INPUT_DURATION:-340}"
+          export MODE MAX_RUNTIME_MINUTES CHECK_INTERVAL_MS RELOGIN_INTERVAL_MS
+          echo "🚀 Launching continuous automation worker Stage 2 (duration: ${MAX_RUNTIME_MINUTES}m)..."
+          xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24 -ac" node index.js
+
+      - name: Auto-dispatch Next Workflow Run
+        if: always() && github.event.inputs.mode != 'single-pass'
+        env:
+          GH_TOKEN: ${{ secrets.ACTIONS_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Attempting to auto-dispatch fresh workflow run..."
+          gh workflow run kvs-automation.yml -r main -f mode=continuous-loop -f duration_minutes=340 || \
+          curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/kvs-automation.yml/dispatches \
+            -d '{"ref":"main","inputs":{"mode":"continuous-loop","duration_minutes":"340"}}' || \
+          echo "Auto-dispatch cycle complete."
+
+  # ====================================================================
+  # STAGE 3 (Hours 11.3 - 17.0)
+  # Automatically starts fresh VM when Stage 2 completes
+  # ====================================================================
+  worker-stage-3:
+    name: Continuous Worker (Stage 3)
+    needs: worker-stage-2
+    if: always() && github.event.inputs.mode != 'single-pass'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Restore browser session cache
+        uses: actions/cache@v4
+        with:
+          path: .kvs_render_profile
+          key: kvs-profile-${{ runner.os }}-${{ github.run_id }}-3
+          restore-keys: |
+            kvs-profile-${{ runner.os }}-${{ github.run_id }}-
+            kvs-profile-${{ runner.os }}-
+
+      - name: Install Node dependencies
+        run: npm ci || npm install
+
+      - name: Install Playwright & OS dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Run KVS Automation
+        env:
+          KVS_LOGIN_IDS: ${{ secrets.KVS_LOGIN_IDS }}
+          KVS_LOGIN_ID: ${{ secrets.KVS_LOGIN_ID }}
+          KVS_UNIVERSAL_PASSWORD: ${{ secrets.KVS_UNIVERSAL_PASSWORD }}
+          KVS_ALTERNATE_PASSWORD: ${{ secrets.KVS_ALTERNATE_PASSWORD }}
+          CHECK_INTERVAL_MS: '300000'
+          RELOGIN_INTERVAL_MS: '900000'
+          HEADLESS: 'false'
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_DURATION: ${{ github.event.inputs.duration_minutes }}
+          SECRET_SCHEDULE_MODE: ${{ secrets.SCHEDULE_MODE }}
+          SECRET_SCHEDULE_DURATION: ${{ secrets.SCHEDULE_DURATION_MINUTES }}
+        run: |
+          MODE="continuous-loop"
+          MAX_RUNTIME_MINUTES="${INPUT_DURATION:-340}"
+          export MODE MAX_RUNTIME_MINUTES CHECK_INTERVAL_MS RELOGIN_INTERVAL_MS
+          echo "🚀 Launching continuous automation worker Stage 3 (duration: ${MAX_RUNTIME_MINUTES}m)..."
+          xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24 -ac" node index.js
+
+      - name: Auto-dispatch Next Workflow Run
+        if: always() && github.event.inputs.mode != 'single-pass'
+        env:
+          GH_TOKEN: ${{ secrets.ACTIONS_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Attempting to auto-dispatch fresh workflow run..."
+          gh workflow run kvs-automation.yml -r main -f mode=continuous-loop -f duration_minutes=340 || \
+          curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/kvs-automation.yml/dispatches \
+            -d '{"ref":"main","inputs":{"mode":"continuous-loop","duration_minutes":"340"}}' || \
+          echo "Auto-dispatch cycle complete."
+
+  # ====================================================================
+  # STAGE 4 (Hours 17.0 - 22.6)
+  # Automatically starts fresh VM when Stage 3 completes
+  # ====================================================================
+  worker-stage-4:
+    name: Continuous Worker (Stage 4)
+    needs: worker-stage-3
+    if: always() && github.event.inputs.mode != 'single-pass'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Restore browser session cache
+        uses: actions/cache@v4
+        with:
+          path: .kvs_render_profile
+          key: kvs-profile-${{ runner.os }}-${{ github.run_id }}-4
+          restore-keys: |
+            kvs-profile-${{ runner.os }}-${{ github.run_id }}-
+            kvs-profile-${{ runner.os }}-
+
+      - name: Install Node dependencies
+        run: npm ci || npm install
+
+      - name: Install Playwright & OS dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Run KVS Automation
+        env:
+          KVS_LOGIN_IDS: ${{ secrets.KVS_LOGIN_IDS }}
+          KVS_LOGIN_ID: ${{ secrets.KVS_LOGIN_ID }}
+          KVS_UNIVERSAL_PASSWORD: ${{ secrets.KVS_UNIVERSAL_PASSWORD }}
+          KVS_ALTERNATE_PASSWORD: ${{ secrets.KVS_ALTERNATE_PASSWORD }}
+          CHECK_INTERVAL_MS: '300000'
+          RELOGIN_INTERVAL_MS: '900000'
+          HEADLESS: 'false'
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_DURATION: ${{ github.event.inputs.duration_minutes }}
+          SECRET_SCHEDULE_MODE: ${{ secrets.SCHEDULE_MODE }}
+          SECRET_SCHEDULE_DURATION: ${{ secrets.SCHEDULE_DURATION_MINUTES }}
+        run: |
+          MODE="continuous-loop"
+          MAX_RUNTIME_MINUTES="${INPUT_DURATION:-340}"
+          export MODE MAX_RUNTIME_MINUTES CHECK_INTERVAL_MS RELOGIN_INTERVAL_MS
+          echo "🚀 Launching continuous automation worker Stage 4 (duration: ${MAX_RUNTIME_MINUTES}m)..."
+          xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24 -ac" node index.js
+
+      - name: Auto-dispatch Next Workflow Run
+        if: always() && github.event.inputs.mode != 'single-pass'
+        env:
+          GH_TOKEN: ${{ secrets.ACTIONS_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Attempting to auto-dispatch fresh workflow run..."
+          gh workflow run kvs-automation.yml -r main -f mode=continuous-loop -f duration_minutes=340 || \
+          curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/kvs-automation.yml/dispatches \
+            -d '{"ref":"main","inputs":{"mode":"continuous-loop","duration_minutes":"340"}}' || \
+          echo "Auto-dispatch cycle complete."

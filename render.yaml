@@ -18,10 +18,12 @@ services:
     envVars:
       - key: KVS_BASE_URL
         value: https://samagam.kvs.gov.in
+      - key: KVS_LOGIN_IDS
+        sync: false # Set in Render Dashboard
       - key: KVS_LOGIN_ID
         sync: false # Set in Render Dashboard
       - key: KVS_UNIVERSAL_PASSWORD
-        value: samagam # Universal password
+        sync: false # Set in Render Dashboard
       - key: KVS_ALTERNATE_PASSWORD
         sync: false # Set in Render Dashboard if needed
       - key: CHECK_INTERVAL_MS
@@ -47,10 +49,12 @@ services:
   #   envVars:
   #     - key: KVS_BASE_URL
   #       value: https://samagam.kvs.gov.in
+  #     - key: KVS_LOGIN_IDS
+  #       sync: false
   #     - key: KVS_LOGIN_ID
   #       sync: false
   #     - key: KVS_UNIVERSAL_PASSWORD
-  #       value: samagam
+  #       sync: false
   #     - key: KVS_ALTERNATE_PASSWORD
   #       sync: false
   #     - key: CHECK_INTERVAL_MS

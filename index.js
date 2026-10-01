@@ -1,23 +1,23 @@
 /**
  * index.js
  * Robust Node.js + Playwright Automation Engine for KVS Samagam Portal
- * Optimized for Continuous Background Worker deployment on Render.com
+ * Optimized for Continuous Background Worker deployment on Render.com & GitHub Actions
  *
  * Implements:
  * 1. Universal Password Architecture:
- *    - The universal baseline password is `samagam` (KVS_UNIVERSAL_PASSWORD).
+ *    - The universal baseline password is read from KVS_UNIVERSAL_PASSWORD.
  *    - All verifications and relogins target this universal password.
  * 2. Multi-profile separation:
  *    - Main Logged-In Profile: Stays authenticated continuously and handles 15m relogin cycle.
  *    - Verification Profile: Isolated browser profile used for 5m independent credential checks.
  * 3. Automatic Password Restoration to Universal Password:
  *    - If the password is changed and 5m verification fails showing incorrect password,
- *      the engine automatically restores the password BACK to `samagam` from the logged-in profile
+ *      the engine automatically restores the password BACK to the universal baseline from the logged-in profile
  *      via direct navigation to `https://samagam.kvs.gov.in/user/update-password`.
  * 4. 15-minute mandatory logout/relogin cycle on the main profile.
  * 5. AsyncMutex coordinating verification, password restoration, and relogin cycles.
  * 6. Non-sensitive, structured logging with automatic secret redaction.
- * 7. Clean SIGTERM/SIGINT signal handling for zero-downtime Render redeployments.
+ * 7. Clean SIGTERM/SIGINT signal handling for zero-downtime redeployments.
  */
 
 require('dotenv').config();
@@ -36,29 +36,22 @@ const LOGIN_URL = `${BASE_URL}/user/login`;
 const LOGOUT_URL = `${BASE_URL}/logout`;
 const UPDATE_PASSWORD_URL = `${BASE_URL}/user/update-password`;
 
-const DEFAULT_LOGIN_IDS = ['EP.45354', 'EP.50696', 'CS.136206'];
-
 function parseLoginIds() {
   if (process.env.KVS_LOGIN_IDS) {
     return process.env.KVS_LOGIN_IDS.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
   }
   if (process.env.KVS_LOGIN_ID) {
-    if (process.env.KVS_LOGIN_ID.includes(',')) {
-      return process.env.KVS_LOGIN_ID.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
-    }
-    if (!DEFAULT_LOGIN_IDS.includes(process.env.KVS_LOGIN_ID)) {
-      return [process.env.KVS_LOGIN_ID, ...DEFAULT_LOGIN_IDS];
-    }
+    return process.env.KVS_LOGIN_ID.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
   }
-  return DEFAULT_LOGIN_IDS;
+  return [];
 }
 
 const LOGIN_IDS = parseLoginIds();
-const LOGIN_ID = LOGIN_IDS[0]; // Primary ID for single-account backwards compatibility
-// Universal password baseline (default: samagam)
-const UNIVERSAL_PASSWORD = process.env.KVS_UNIVERSAL_PASSWORD || process.env.KVS_PASSWORD_1 || 'samagam';
+const LOGIN_ID = LOGIN_IDS[0] || ''; // Primary ID for single-account backwards compatibility
+// Universal baseline password from environment / secrets
+const UNIVERSAL_PASSWORD = process.env.KVS_UNIVERSAL_PASSWORD || process.env.KVS_PASSWORD_1 || '';
 // Optional alternate password candidate (if password was temporarily changed)
-const ALTERNATE_PASSWORD = process.env.KVS_ALTERNATE_PASSWORD || process.env.KVS_PASSWORD_2 || 'writukapanty';
+const ALTERNATE_PASSWORD = process.env.KVS_ALTERNATE_PASSWORD || process.env.KVS_PASSWORD_2 || '';
 
 const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || '300000', 10);   // Default: 5 min
 const RELOGIN_INTERVAL_MS = parseInt(process.env.RELOGIN_INTERVAL_MS || '900000', 10); // Updated: 15 min
@@ -172,7 +165,7 @@ function renderCountdownTick() {
 
   const vStr = isVerificationRunning ? 'in progress...' : formatRemaining(vMs);
   const rStr = isReloginRunning ? 'in progress...' : formatRemaining(rMs);
-  const activeLabel = activePassword === UNIVERSAL_PASSWORD ? 'samagam' : 'custom';
+  const activeLabel = activePassword === UNIVERSAL_PASSWORD ? 'universal' : 'custom';
 
   const tickerMsg = `⏱️  [TIMERS] (${LOGIN_IDS.length} accounts: ${LOGIN_IDS.join(', ')}) Verification in: ${vStr} | Relogin in: ${rStr} (Active: ${activeLabel})`;
 
@@ -194,7 +187,7 @@ function renderCountdownTick() {
  * Return display-safe indicator of which password is currently active
  */
 function getActivePasswordLabel() {
-  return activePassword === UNIVERSAL_PASSWORD ? 'UNIVERSAL_PASSWORD (samagam)' : 'CUSTOM_PASSWORD';
+  return activePassword === UNIVERSAL_PASSWORD ? 'UNIVERSAL_PASSWORD' : 'CUSTOM_PASSWORD';
 }
 
 /**
@@ -238,7 +231,7 @@ function getAutomationStatus() {
   return {
     uptimeSeconds: startTime ? Math.floor((Date.now() - startTime) / 1000) : 0,
     activePassword: getActivePasswordLabel(),
-    universalPassword: 'samagam',
+    universalPassword: UNIVERSAL_PASSWORD ? '[CONFIGURED]' : '[NOT_SET]',
     updatePasswordUrl: UPDATE_PASSWORD_URL,
     isMutexLocked: sessionMutex.isLocked(),
     isBrowserActive: anyBrowserActive,
@@ -246,7 +239,7 @@ function getAutomationStatus() {
       const s = accountSessions.get(id);
       return {
         loginId: id,
-        activePassword: s ? (s.activePassword === UNIVERSAL_PASSWORD ? 'samagam' : 'custom') : 'samagam',
+        activePassword: s ? (s.activePassword === UNIVERSAL_PASSWORD ? 'universal' : 'custom') : 'universal',
         isBrowserActive: !!(s && s.mainBrowserContext && s.mainPage && !s.mainPage.isClosed()),
         lastVerification: s ? s.lastVerificationResult : null,
         lastRelogin: s ? s.lastReloginResult : null,
@@ -624,11 +617,11 @@ async function performLogout(page) {
 }
 
 // ==========================================
-// RESTORE PASSWORD TO UNIVERSAL PASSWORD (samagam)
+// RESTORE PASSWORD TO UNIVERSAL BASELINE PASSWORD
 // ==========================================
 
 /**
- * Restores password back to the universal password (samagam) from the logged-in profile.
+ * Restores password back to the universal baseline password from the logged-in profile.
  * Navigates directly to https://samagam.kvs.gov.in/user/update-password
  *
  * @param {Page} page - The main authenticated page
@@ -638,7 +631,7 @@ async function performLogout(page) {
  */
 async function restorePasswordToUniversal(page, candidateOldPassword, loginId) {
   const targetLoginId = loginId || LOGIN_ID;
-  logger.warn(`Restoring portal password back to universal password (${UNIVERSAL_PASSWORD}) for ${targetLoginId} from logged-in profile...`);
+  logger.warn(`Restoring portal password back to universal baseline password for ${targetLoginId} from logged-in profile...`);
   logger.info(`Navigating directly to: ${UPDATE_PASSWORD_URL}`);
 
   try {
@@ -747,8 +740,8 @@ async function verifyInSeparateProfile(passwordToTest, loginId) {
 
 /**
  * 5-Minute verification cycle handler
- * Checks if portal still authenticates with universal password (samagam) for all accounts.
- * If password was changed and verification fails, restores password back to samagam from logged-in profile.
+ * Checks if portal still authenticates with universal baseline password for all accounts.
+ * If password was changed and verification fails, restores password back to universal baseline from logged-in profile.
  */
 async function runVerificationCycle() {
   if (isShuttingDown) return;
@@ -761,7 +754,7 @@ async function runVerificationCycle() {
     for (const session of accountSessions.values()) {
       if (isShuttingDown) break;
       const accountId = session.loginId;
-      logger.info(`[5-Min Cycle] Verifying account ${accountId} with universal password (${UNIVERSAL_PASSWORD})...`);
+      logger.info(`[5-Min Cycle] Verifying account ${accountId} with universal baseline password...`);
 
       // 1. Ensure main logged-in page reference is valid
       if (!session.mainPage || session.mainPage.isClosed()) {
@@ -786,7 +779,7 @@ async function runVerificationCycle() {
       lastVerificationResult = session.lastVerificationResult;
 
       if (verificationResult.success) {
-        logger.info(`[5-Min Cycle] Verification successful for ${accountId}. Universal password (${UNIVERSAL_PASSWORD}) is valid on the portal.`);
+        logger.info(`[5-Min Cycle] Verification successful for ${accountId}. Universal password is valid on the portal.`);
         session.activePassword = UNIVERSAL_PASSWORD;
         continue;
       }
@@ -794,19 +787,19 @@ async function runVerificationCycle() {
       const isPasswordError = isIncorrectPasswordError(verificationResult.reason);
       logger.warn(`[5-Min Cycle] Verification failed for ${accountId}: ${verificationResult.reason} (isIncorrectPassword: ${isPasswordError})`);
 
-      // 3. If password was changed and verification fails, change it back to samagam from logged-in profile
+      // 3. If password was changed and verification fails, restore it back to universal baseline from logged-in profile
       if (isPasswordError) {
         const mainStillAuthenticated = await isPageAuthenticated(session.mainPage);
         logger.info(`Checking logged-in profile status for ${accountId}: ${mainStillAuthenticated ? 'STILL AUTHENTICATED' : 'UNAUTHENTICATED'}`);
 
         if (mainStillAuthenticated) {
-          logger.warn(`Password was changed away from universal password for ${accountId}! Initiating password restore to ${UNIVERSAL_PASSWORD} from logged-in profile...`);
+          logger.warn(`Password was changed away from universal baseline for ${accountId}! Initiating password restore from logged-in profile...`);
           const restored = await restorePasswordToUniversal(session.mainPage, ALTERNATE_PASSWORD, accountId);
           if (restored) {
             session.activePassword = UNIVERSAL_PASSWORD;
-            logger.info(`Password successfully restored back to universal password (${UNIVERSAL_PASSWORD}) for ${accountId}!`);
+            logger.info(`Password successfully restored back to universal baseline password for ${accountId}!`);
           } else {
-            logger.error(`Failed to restore password back to universal password for ${accountId}.`);
+            logger.error(`Failed to restore password back to universal baseline password for ${accountId}.`);
           }
         } else {
           logger.error(`Main session has expired for ${accountId}. Cannot restore password without an active session.`);
@@ -889,10 +882,19 @@ async function runReloginCycle() {
 async function startAutomation() {
   startTime = Date.now();
   logger.info('========================================================');
+  if (LOGIN_IDS.length === 0) {
+    logger.error('No login IDs provided. Please set KVS_LOGIN_IDS (or KVS_LOGIN_ID) in your environment or repository secrets.');
+    process.exit(1);
+  }
+  if (!UNIVERSAL_PASSWORD && process.env.NODE_ENV !== 'test') {
+    logger.error('No universal password provided. Please set KVS_UNIVERSAL_PASSWORD in your environment or repository secrets.');
+    process.exit(1);
+  }
+
   logger.info('Starting KVS Samagam Continuous Automation Engine');
   logger.info(`Target URL: ${BASE_URL}`);
-  logger.info(`Active Accounts (${LOGIN_IDS.length}): ${LOGIN_IDS.join(', ')}`);
-  logger.info(`Universal Password: ${UNIVERSAL_PASSWORD}`);
+  logger.info(`Active Accounts (${LOGIN_IDS.length}): ${LOGIN_IDS.map(id => id.slice(0, 3) + '***').join(', ')}`);
+  logger.info(`Universal Baseline Password: ${UNIVERSAL_PASSWORD ? '[CONFIGURED]' : '[NOT_SET]'}`);
   logger.info(`Password Update URL: ${UPDATE_PASSWORD_URL}`);
   logger.info(`Root Data Directory: ${DATA_DIR}`);
   logger.info(`Verification Interval: ${CHECK_INTERVAL_MS / 1000}s (5m) | Relogin Interval: ${RELOGIN_INTERVAL_MS / 1000}s (15m)`);
@@ -908,7 +910,7 @@ async function startAutomation() {
       const pages = session.mainBrowserContext.pages();
       session.mainPage = pages.length > 0 ? pages[0] : await session.mainBrowserContext.newPage();
 
-      logger.info(`Attempting initial login for ${accountId} on main page with universal password (${UNIVERSAL_PASSWORD})...`);
+      logger.info(`Attempting initial login for ${accountId} on main page with universal password...`);
       let initialLogin = await performLogin(session.mainPage, UNIVERSAL_PASSWORD, accountId);
 
       // Transient retry
@@ -923,7 +925,7 @@ async function startAutomation() {
         logger.warn(`Universal password failed for ${accountId} with credential mismatch: ${initialLogin.reason}. Checking alternate candidate...`);
         const altLogin = await performLogin(session.mainPage, ALTERNATE_PASSWORD, accountId);
         if (altLogin.success) {
-          logger.info(`Logged in ${accountId} with alternate password. Automatically restoring password to universal password (${UNIVERSAL_PASSWORD})...`);
+          logger.info(`Logged in ${accountId} with alternate password. Automatically restoring password to universal baseline...`);
           await restorePasswordToUniversal(session.mainPage, ALTERNATE_PASSWORD, accountId);
           initialLogin = altLogin;
         }

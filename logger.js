@@ -11,8 +11,13 @@ function getSensitiveValues() {
     process.env.KVS_PASSWORD_1,
     process.env.KVS_PASSWORD_2,
     process.env.KVS_ALTERNATE_PASSWORD,
-    'samagam', // explicitly safeguard universal password value
   ];
+  if (process.env.KVS_LOGIN_IDS) {
+    vars.push(...process.env.KVS_LOGIN_IDS.split(/[,;\s]+/).map(s => s.trim()));
+  }
+  if (process.env.KVS_LOGIN_ID) {
+    vars.push(...process.env.KVS_LOGIN_ID.split(/[,;\s]+/).map(s => s.trim()));
+  }
   for (const v of vars) {
     if (v && typeof v === 'string' && v.length > 2 && !sensitive.includes(v)) {
       sensitive.push(v);

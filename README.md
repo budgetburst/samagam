@@ -2,28 +2,27 @@
 
 A robust Node.js and Playwright automation background worker designed for 24/7 continuous operation on **GitHub Actions** and **Render.com**.
 
-Monitors and maintains continuous authenticated sessions across multiple KVS portal accounts (`EP.45354`, `EP.50696`, `CS.136206`), performs credential integrity verification in isolated browser profiles every 5 minutes, executes periodic 15-minute logout/login maintenance cycles, and automatically restores credentials back to the universal baseline password (`samagam`) if changed.
+Monitors and maintains continuous authenticated sessions across multiple configured KVS portal accounts, performs credential integrity verification in isolated browser profiles every 5 minutes, executes periodic 15-minute logout/login maintenance cycles, and automatically restores credentials back to the universal baseline password if changed.
 
 ---
 
 ## Key Features
 
 1. **Multi-Account Concurrent & Isolated Architecture**:
-   - Manages multiple accounts seamlessly (default: `EP.45354`, `EP.50696`, `CS.136206`).
-   - Configurable via comma-separated `KVS_LOGIN_IDS`.
-   - Each account has dedicated browser sandboxes (`main_profile/<safeId>` and `verify_profile/<safeId>`), ensuring zero cookie cross-contamination or session collisions.
+   - Manages multiple accounts simultaneously via comma-separated `KVS_LOGIN_IDS`.
+   - Each account operates inside dedicated browser sandboxes (`main_profile/<safeId>` and `verify_profile/<safeId>`), ensuring zero cookie cross-contamination or session collisions.
 
-2. **Universal Password Architecture (`samagam`)**:
-   - Universal baseline password is `samagam` (`KVS_UNIVERSAL_PASSWORD`).
-   - All verifications and relogins target this universal password across all configured accounts.
-   - Supports fallback candidate `writukapanty` (`KVS_ALTERNATE_PASSWORD`) if ever needed during transition.
+2. **Universal Baseline Password Architecture**:
+   - Primary baseline password configured via `KVS_UNIVERSAL_PASSWORD`.
+   - All verifications and relogins target this universal baseline password across all configured accounts.
+   - Supports an optional fallback candidate (`KVS_ALTERNATE_PASSWORD`) to recover access if credentials were changed.
 
 3. **Strict 5-Minute Verification & 15-Minute Relogin Schedules**:
-   - **5-Minute Credential Verification**: Checks login validity using an isolated, ephemeral verification profile for each account without disrupting the active main session.
+   - **5-Minute Credential Verification**: Checks login validity using an isolated, ephemeral verification profile for each account without disrupting active sessions.
    - **15-Minute Relogin Maintenance**: Performs clean session renewal (logout and re-authentication) in the main profile.
 
 4. **Automatic Password Self-Healing**:
-   - If an account password is changed and 5-minute verification fails with an incorrect password error, the engine navigates to `https://samagam.kvs.gov.in/user/update-password` from the logged-in main profile, restores the password **BACK to `samagam`**, and validates in the verification profile.
+   - If an account password fails 5-minute verification due to credential mismatch, the engine navigates to the portal password update page from the logged-in main profile, restores the password **BACK to the universal baseline password**, and verifies restoration in the isolated profile.
 
 5. **Government NIC SSL & Cloudflare Turnstile Handling**:
    - Configured with `ignoreHTTPSErrors: true` and `--ignore-certificate-errors` to handle the government NIC certificate chain on `samagam.kvs.gov.in`.
@@ -31,17 +30,15 @@ Monitors and maintains continuous authenticated sessions across multiple KVS por
    - Actively polls `cf-turnstile-response` to ensure Cloudflare verification completes before form submission.
    - Directly triggers login modal rendering in the DOM if overlays are inactive.
 
-6. **24/7 Continuous Cloud Execution via GitHub Actions**:
-   - Public repository hosted at [budgetburst/samagam](https://github.com/budgetburst/samagam.git) with **unlimited free GitHub Actions compute minutes**.
-   - Automated cron schedule triggers every 28 minutes.
-   - Auto-chaining dispatch keeps continuous-loop runners alive 24/7.
+6. **24/7 Continuous Execution (GitHub Actions)**:
+   - Hosted on public repository [budgetburst/samagam](https://github.com/budgetburst/samagam.git) with **unlimited free GitHub Actions compute minutes**.
+   - **Multi-Stage Worker Pipeline**: Executes sequential 340-minute stages (`Stage 1` -> `Stage 2` -> `Stage 3` -> `Stage 4`) within a single workflow run (~23 hours of continuous runtime per run), where each stage runs on a fresh VM with clean memory and restored session cache.
+   - **Self-Chaining Auto-Dispatch**: Automatically dispatches a fresh workflow run upon stage completion using GitHub Actions tokens, keeping the engine running 24/7 without manual restarts.
+   - **Automated Cron Queue**: Periodic schedule keeps queued runs ready to execute immediately when previous runs conclude.
+   - **Keepalive Protection**: Built-in repository keepalive workflow prevents GitHub from disabling scheduled actions due to repo inactivity.
 
-7. **Dual-Mode Web Service / Background Worker (Render.com)**:
-   - Includes lightweight HTTP server (`server.js`) listening on port 10000 with `/healthz` and `/status` endpoints.
-   - Real-time JSON health reporting per account.
-
-8. **Zero Credential Leaks**:
-   - Built-in redaction filter in `logger.js` prevents passwords, cookies, and tokens from appearing in console logs or CI artifacts.
+7. **Zero Credential Leaks**:
+   - Built-in redaction filter in `logger.js` automatically redacts all configured passwords, tokens, cookies, and login IDs from stdout and CI logs.
 
 ---
 
@@ -65,12 +62,12 @@ Monitors and maintains continuous authenticated sessions across multiple KVS por
 
 ## Configuration & Environment Variables
 
-| Variable | Description | Default / Example |
+| Variable | Description | Example / Format |
 | :--- | :--- | :--- |
-| `KVS_LOGIN_IDS` | Comma-separated list of login IDs | `EP.45354,EP.50696,CS.136206` |
-| `KVS_LOGIN_ID` | Single account fallback (if `KVS_LOGIN_IDS` omitted) | `EP.45354` |
-| `KVS_UNIVERSAL_PASSWORD` | Primary baseline password | `samagam` |
-| `KVS_ALTERNATE_PASSWORD` | Fallback candidate password | `writukapanty` |
+| `KVS_LOGIN_IDS` | Comma-separated list of login IDs | `YOUR_ID_1,YOUR_ID_2,YOUR_ID_3` |
+| `KVS_LOGIN_ID` | Single account fallback (if `KVS_LOGIN_IDS` omitted) | `YOUR_ID_1` |
+| `KVS_UNIVERSAL_PASSWORD` | Universal baseline password | `YOUR_UNIVERSAL_PASSWORD` |
+| `KVS_ALTERNATE_PASSWORD` | Optional fallback candidate password | `YOUR_ALTERNATE_PASSWORD` |
 | `KVS_BASE_URL` | Portal base URL | `https://samagam.kvs.gov.in` |
 | `CHECK_INTERVAL_MS` | Verification interval (ms) | `300000` (5 minutes) |
 | `RELOGIN_INTERVAL_MS` | Relogin maintenance interval (ms) | `900000` (15 minutes) |
@@ -81,30 +78,25 @@ Monitors and maintains continuous authenticated sessions across multiple KVS por
 
 ## Deployment: GitHub Actions (Recommended - 100% Free 24/7)
 
-The repository at [https://github.com/budgetburst/samagam.git](https://github.com/budgetburst/samagam.git) is public, granting **unlimited free GitHub Actions runner minutes** with 7 GB of RAM and virtual display support.
+The public repository at [budgetburst/samagam](https://github.com/budgetburst/samagam.git) has **unlimited free GitHub Actions runner minutes** with 7 GB of RAM and virtual display support.
 
 ### 1. Add Repository Secrets
 In your GitHub repository:
 Navigate to **Settings** > **Secrets and variables** > **Actions** > **New repository secret**:
-- `KVS_LOGIN_IDS`: `EP.45354,EP.50696,CS.136206`
-- `KVS_UNIVERSAL_PASSWORD`: `samagam`
-- `KVS_ALTERNATE_PASSWORD`: `writukapanty` (optional)
+- `KVS_LOGIN_IDS`: Your comma-separated login IDs (e.g. `YOUR_ID_1,YOUR_ID_2,YOUR_ID_3`)
+- `KVS_UNIVERSAL_PASSWORD`: Your universal baseline password
+- `KVS_ALTERNATE_PASSWORD`: Your fallback candidate password (optional)
+- `ACTIONS_PAT`: *(Recommended for seamless 24/7 auto-restart)* A GitHub Personal Access Token (classic) with `repo` and `workflow` permissions. This allows each workflow run to automatically dispatch the next fresh run without human intervention.
 
-### 2. Execution Modes
-The workflow (`.github/workflows/kvs-automation.yml`) supports two operational modes:
+### 2. How the 24/7 Fresh Restarts Work
+GitHub Actions has a 360-minute (6-hour) maximum execution limit per job. The automation engine handles this automatically through a 3-tier architecture:
+1. **Multi-Stage Sequential Jobs**: Each workflow run executes 4 sequential stages (`Stage 1` -> `Stage 2` -> `Stage 3` -> `Stage 4`), each running for ~340 minutes on a fresh runner VM. When Stage 1 reaches 340 minutes, Stage 2 launches immediately on a fresh runner with clean RAM and restored session cookies.
+2. **Auto-Dispatch Chaining**: As each stage completes, the workflow dispatches a fresh new workflow run via GitHub API / `gh` CLI.
+3. **Continuous Cron Fallback**: The scheduled trigger keeps pending runs queued in GitHub Actions, ensuring that if a runner terminates, the next run starts immediately.
 
-1. **Continuous Loop (`continuous-loop`)**:
-   - Runs the full automation engine continuously across all 3 accounts.
-   - Executes 5-minute credential integrity checks and 15-minute relogins.
-   - Runs up to 350 minutes per job, with automated cron triggers (every 28 minutes) and automatic dispatch chaining to achieve seamless 24/7 operation.
-2. **Single Pass (`single-pass`)**:
-   - Iterates sequentially through all configured accounts.
-   - Verifies credentials, triggers password restoration to `samagam` if tampered with, logs into the main session, and exits cleanly.
-
-### 3. Manual Workflow Dispatch
-1. Go to the **Actions** tab on your GitHub repository.
-2. Select **KVS Samagam Multi-Account Automation** on the left menu.
-3. Click **Run workflow**, choose your mode (`continuous-loop` or `single-pass`), and confirm.
+### 3. Execution Modes
+- **Continuous Loop (`continuous-loop`)**: Runs multi-stage continuous workers with 5-minute verification and 15-minute relogins 24/7.
+- **Single Pass (`single-pass`)**: Iterates through all accounts once, verifies credentials, restores baseline password if needed, refreshes sessions, and exits cleanly (~1 min).
 
 ---
 
@@ -115,31 +107,12 @@ The workflow (`.github/workflows/kvs-automation.yml`) supports two operational m
 1. Go to your [Render Dashboard](https://dashboard.render.com).
 2. Click **New** > **Blueprint**.
 3. Connect your repository: `https://github.com/budgetburst/samagam.git`.
-4. Render will automatically parse `render.yaml` and configure the Docker service.
+4. Render will parse `render.yaml` and configure the Docker service.
 5. In the Render Dashboard, fill in your secret environment variables:
-   - `KVS_LOGIN_IDS`: `EP.45354,EP.50696,CS.136206`
-   - `KVS_UNIVERSAL_PASSWORD`: `samagam`
-   - `KVS_ALTERNATE_PASSWORD`: `writukapanty`
+   - `KVS_LOGIN_IDS`: `YOUR_ID_1,YOUR_ID_2,YOUR_ID_3`
+   - `KVS_UNIVERSAL_PASSWORD`: `YOUR_UNIVERSAL_PASSWORD`
+   - `KVS_ALTERNATE_PASSWORD`: `YOUR_ALTERNATE_PASSWORD`
 6. Click **Apply**.
-
-### Option B: Deploy as a Web Service (Docker)
-
-1. Click **New** > **Web Service**.
-2. Select your repository `https://github.com/budgetburst/samagam.git`.
-3. Configure the service:
-   - **Runtime**: `Docker`
-   - **Region**: Oregon or Frankfurt
-   - **Plan**: Free or Starter
-4. Under **Environment Variables**, set:
-   - `PORT`: `10000`
-   - `HEADLESS`: `false`
-   - `DISPLAY`: `:99`
-   - `KVS_BASE_URL`: `https://samagam.kvs.gov.in`
-   - `KVS_LOGIN_IDS`: `EP.45354,EP.50696,CS.136206`
-   - `KVS_UNIVERSAL_PASSWORD`: `samagam`
-   - `CHECK_INTERVAL_MS`: `300000` (5 minutes)
-   - `RELOGIN_INTERVAL_MS`: `900000` (15 minutes)
-5. Click **Deploy Web Service**.
 
 ---
 
@@ -154,17 +127,17 @@ When running `server.js` (on Render or local server), monitor service health via
     "status": "healthy",
     "automation": {
       "uptimeSeconds": 1820,
-      "accounts": ["EP.45354", "EP.50696", "CS.136206"],
-      "universalPassword": "samagam",
+      "activePassword": "UNIVERSAL_PASSWORD",
+      "universalPassword": "[CONFIGURED]",
       "updatePasswordUrl": "https://samagam.kvs.gov.in/user/update-password",
       "intervals": {
         "verificationMinutes": 5,
         "reloginMinutes": 15
       },
       "accountStatuses": {
-        "EP.45354": { "lastVerification": "success", "lastRelogin": "success" },
-        "EP.50696": { "lastVerification": "success", "lastRelogin": "success" },
-        "CS.136206": { "lastVerification": "success", "lastRelogin": "success" }
+        "ACCOUNT_1": { "lastVerification": "success", "lastRelogin": "success" },
+        "ACCOUNT_2": { "lastVerification": "success", "lastRelogin": "success" },
+        "ACCOUNT_3": { "lastVerification": "success", "lastRelogin": "success" }
       }
     }
   }
@@ -186,14 +159,14 @@ Expected output:
 1. Testing Logger Sanitization...
    [PASS] Logger correctly redacts universal password, alternate passwords, and session cookies.
 2. Testing Universal Password & URL Configuration...
-   [PASS] Universal baseline password: samagam
+   [PASS] Universal baseline password loaded correctly.
    [PASS] Password update URL: https://samagam.kvs.gov.in/user/update-password
 3. Testing Profile Separation Architecture...
    [PASS] Main Profile: .../.kvs_render_profile/main_profile
    [PASS] Verify Profile: .../.kvs_render_profile/verify_profile
    [PASS] Separate profiles guaranteed for logged-in session and verification.
 3b. Testing Multi-Account Configuration & Directory Paths...
-   [PASS] Multi-account support verified: [EP.45354, EP.50696, CS.136206]
+   [PASS] Multi-account support verified: [TEST_USER_1, TEST_USER_2, TEST_USER_3]
    [PASS] Dedicated isolated profile paths guaranteed for each account.
 4. Testing Incorrect Password Error Parser...
    [PASS] isIncorrectPasswordError accurately detects credential failures vs transient issues.
@@ -202,7 +175,7 @@ Expected output:
 6. Testing Selectors Registry...
    [PASS] All selector definitions validated.
 7. Testing Universal Password Restoration Logic...
-   [PASS] Password restored back to universal password (samagam) from logged-in profile.
+   [PASS] Password restored back to universal password from logged-in profile.
 8. Testing Action Runner Module Structure...
    [PASS] Action runner module loaded and verified successfully.
 --- ALL VERIFICATION CHECKS PASSED SUCCESSFULLY ---
