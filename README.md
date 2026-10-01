@@ -35,7 +35,6 @@ Monitors and maintains continuous authenticated sessions across multiple configu
    - **Multi-Stage Worker Pipeline**: Executes sequential 340-minute stages (`Stage 1` -> `Stage 2` -> `Stage 3` -> `Stage 4`) within a single workflow run (~23 hours of continuous runtime per run), where each stage runs on a fresh VM with clean memory and restored session cache.
    - **Self-Chaining Auto-Dispatch**: Automatically dispatches a fresh workflow run upon stage completion using GitHub Actions tokens, keeping the engine running 24/7 without manual restarts.
    - **Automated Cron Queue**: Periodic schedule keeps queued runs ready to execute immediately when previous runs conclude.
-   - **Keepalive Protection**: Built-in repository keepalive workflow prevents GitHub from disabling scheduled actions due to repo inactivity.
 
 7. **Zero Credential Leaks**:
    - Built-in redaction filter in `logger.js` automatically redacts all configured passwords, tokens, cookies, and login IDs from stdout and CI logs.
